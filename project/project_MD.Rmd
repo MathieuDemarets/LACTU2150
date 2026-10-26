@@ -35,21 +35,17 @@ options(encoding = 'UTF-8')
 if (!require("dplyr")) install.packages("dplyr")
 if (!require("forcats")) install.packages("forcats")
 if (!require("kableExtra")) install.packages("kableExtra")
-if (!require("DT")) install.packages("DT")
 if (!require("knitr")) install.packages("knitr")
-if (!require("broom")) install.packages("broom")
-if (!require("assertthat")) install.packages("assertthat")
 if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("plotly")) install.packages("plotly")
 
 
 library(dplyr)
 library(forcats)
 library(kableExtra)
 library(knitr)
-library(assertthat)
-library(broom)
-library(DT)
 library(ggplot2)
+library(plotly)
 ```
 
 # Executive Summary
@@ -199,12 +195,13 @@ df_bins <- data.frame(
     count = as.numeric(counts)
 )
 
-ggplot(df_bins, aes(x = bin, y = count)) +
+p <- ggplot(df_bins, aes(x = bin, y = count)) +
 ggtitle("Baseline Quantile Binning (POWER)") +
 geom_col(fill = "steelblue") +
 labs(x = "POWER baseline quantile bin", y = "Policies with at least one claim") +
 theme_minimal() +
 theme(axis.text.x = element_text(angle = 60, hjust = 1))
+ggplotly(p)
 ```
 
 2. Weight of Evidence (WoE) Calculation
@@ -249,7 +246,7 @@ plot_woe_iv <- function(woe_df) {
     } else {
         1
     }
-    ggplot(woe_df, aes(x = bin)) +
+    p <- ggplot(woe_df, aes(x = bin)) +
         geom_col(
             aes(y = woe, fill = woe > 0),
             width = 0.8,
@@ -264,23 +261,20 @@ plot_woe_iv <- function(woe_df) {
         ) +
         geom_point(
             aes(y = iv * scale_factor),
-            color = "blue"
+            color = "blue",
         ) +
         scale_y_continuous(
-            name = "Weight of Evidence (WoE)",
-            sec.axis = sec_axis(
-                ~ . / scale_factor,
-                name = "IV contribution"
-            )
+            name = "WoE and Scale-adjusted IV"
         ) +
         labs(x = "Bins") +
         theme_minimal() +
         theme(
             axis.text.x = element_text(angle = 60, hjust = 1),
-            axis.title.y.right = element_text(color = "blue"),
-            axis.text.y.right = element_text(color = "blue")
         ) +
-        ggtitle("WoE and IV by Bin")
+        ggtitle(
+            paste0("WoE and IV by Bin (bins=", length(woe_df$bin), ")")
+        )
+    ggplotly(p)
 }
 ```
 
@@ -347,22 +341,14 @@ iv_elbow <- function(data, x, y, bins) {
 }
 plot_iv_elbow <- function(iv_elbow_result) {
     first_max_diff <- filter(iv_elbow_result, diff_order == 1)
-    second_max_diff <- filter(iv_elbow_result, diff_order == 2)
-    ggplot(iv_elbow_result, aes(x = n_bins, y = iv)) +
+    p <- ggplot(iv_elbow_result, aes(x = n_bins, y = iv)) +
         geom_line() +
         geom_point() +
         labs(title = "Information Value Elbow Plot", x = "Number of Bins", y = "Information Value") +
         theme_minimal() +
-        # Put a cross (vertical and horizontal lines) at the point with the maximum IV difference
-        
         geom_vline(xintercept = first_max_diff$n_bins, linetype = "dashed", color = "red") +
-        geom_hline(yintercept = first_max_diff$iv, linetype = "dashed", color = "red") +
-        geom_vline(xintercept = second_max_diff$n_bins, linetype = "dashed", color = "blue") +
-        geom_hline(yintercept = second_max_diff$iv, linetype = "dashed", color = "blue") +
-        geom_text(aes(x = first_max_diff$n_bins, y = first_max_diff$iv, label = "First Max Diff"), color = "red", vjust = -1) +
-        geom_text(aes(x = second_max_diff$n_bins, y = second_max_diff$iv, label = "Second Max Diff"), color = "blue", vjust = -1) +
-        geom_text(aes(x = first_max_diff$n_bins, y = min(iv_elbow_result$iv), label = first_max_diff$n_bins), color = "red", vjust = 1) +
-        geom_text(aes(x = second_max_diff$n_bins, y = min(iv_elbow_result$iv), label = second_max_diff$n_bins), color = "blue", vjust = 1)
+        geom_hline(yintercept = first_max_diff$iv, linetype = "dashed", color = "red")
+    ggplotly(p)
 }
 ```
 
@@ -381,7 +367,7 @@ rebuild_bins <- function(iv_elbow_result, n) {
 ```
 
 ```{r rebuild_bins_result}
-opt_bins <-rebuild_bins(result, 9)
+opt_bins <- rebuild_bins(result, filter(result, diff_order == 1)$n_bins)
 woe_ex <- woe_calc(data, x = "POWER", y = "NCLAIMS", bins = opt_bins)
 plot_woe_iv(woe_ex)
 ```
