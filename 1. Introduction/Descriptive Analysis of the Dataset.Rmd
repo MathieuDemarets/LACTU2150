@@ -92,7 +92,7 @@ rm(dataset_alternative)
 ```
 
 ```{r}
-write_parquet(dataset, sink = "../data/dataset.parquet", compression = "gzip")
+write_parquet(dataset, sink = "data/dataset.parquet", compression = "gzip")
 ```
 
 We will save the dataset into a *parquet* file, so we don't need to load the CASdatasets package anymore and filter the data.
@@ -100,7 +100,7 @@ We will save the dataset into a *parquet* file, so we don't need to load the CAS
 For those that could not install this package, now is the time to load the provided *parquet* file.
 
 ```{r}
-dataset <- read_parquet(file = "../data/dataset.parquet")
+dataset <- read_parquet(file = "data/dataset.parquet")
 ```
 
 ### Checking the dataset
