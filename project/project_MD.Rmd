@@ -1005,10 +1005,6 @@ if(pval < 0.05) {
 - The last 3 or last four bins of `POWER_binned`
 
 ```{r merge_power}
-levels(data$POWER_binned)
-
-```
-```{r merge_power}
 data$POWER_binned_merged <- fct_collapse(
     data$POWER_binned, 
     "(51,243]" = c("(51,66]", "(66,83]", "(83,99]", "(99,243]")
