@@ -593,7 +593,7 @@ result <- iv_elbow(data, "AGEPH", "NCLAIMS", bins_ageph)
 plot_iv_elbow(result, interactive = TRUE)
 ```
 
-Looking at the IV elbow plot and taking the number of bins corresponding to the first maximum difference in IV as the optimal choice, we can rebuild the bins with only two bins. Adding a single bin seems sensible as we capture more information with a single additional split.
+Looking at the IV elbow plot and taking the number of bins corresponding to the first maximum difference in IV as the optimal choice, we can rebuild the bins with only three bins. Adding a single bin seems sensible as we capture more information with a single additional split.
 We could also consider 7 or 12 bins that mark other levels in the IV - Number of Bins relationship.
 
 ```{r rebuild_bins}
@@ -607,12 +607,12 @@ rebuild_bins <- function(iv_elbow_result, n) {
 
 ```{r rebuild_bins_result}
 plots <- list()
-for (i in c(2, 3, 7, 12)) {
+for (i in c(3, 4, 7, 12)) {
     temp_bins <- rebuild_bins(result, i)
     woe_temp <- woe_calc(data, x = "AGEPH", y = "NCLAIMS", bins = temp_bins)
     plots[[i]] <- plot_woe_iv(woe_temp, interactive = FALSE)
 }
-(plots[[2]] | plots[[3]] ) / (plots[[7]] | plots[[12]])
+(plots[[3]] | plots[[4]] ) / (plots[[7]] | plots[[12]])
 ```
 
 Based on the comparison above, the optimal amount of bins seems to be 7 because:
@@ -755,7 +755,7 @@ $$ \hat{\lambda} = \frac{\sum NCLAIMS}{\sum e} $$
 $$ \hat{\lambda} \sim \text{Normal}\left(\lambda, \frac{\lambda}{\sum_i d_i}\right) $$
 
 We find the variance as the inverse of the fisher information (itself equal to $-\ell''(\widehat{\lambda})$)
-$$ \text{Var}(\widehat{\lambda}) \approx \I(\widehat{\lambda})^{-1} = \frac{\widehat{\lambda}}{\sum_i d_i}. $$
+$$ \text{Var}(\widehat{\lambda}) \approx \mathcal{I}(\widehat{\lambda})^{-1} = \frac{\widehat{\lambda}}{\sum_i d_i}. $$
 
 Based on this mathematical understanding, we can build a main plot which shows exposures, claims, and claim frequencies with their confidence intervals (95 and 99%) across different bins for each variable.
 
@@ -825,7 +825,7 @@ The same approach can be used for all variables:
 
 #### Categorical Variables
 
-```{r test_all, result="asis"}
+```{r show_cat, result="asis"}
 for (cat_var in c("COVERAGE", "FUEL", "USE", "FLEET", "SEX")) {
     cat(paste0("> ", cat_var, "\n"))
     plot(plot_claim_freq(data, cat_var))
@@ -878,15 +878,173 @@ This variable also has predictive potential for modeling purposes.
 
 #### Numerical Variables
 
-```{r test_all, result="asis"}
-for (cat_var in c("COVERAGE", "FUEL", "USE", "FLEET", "SEX")) {
+Let us now have a look at the binned numerical variables other than the bonus-malus scale that we already interpreted.
+
+```{r show_num, result="asis"}
+for (cat_var in c("AGEPH_binned", "AGEC_binned", "POWER_binned")) {
     cat(paste0("> ", cat_var, "\n"))
     plot(plot_claim_freq(data, cat_var))
 }
 ```
 
+- `AGEPH_binned`
+
+We see the risk diminution as the age of the policyholder increases as we identified with our binning algorithm.
+However, we see that the last three are not significantly different from one another in terms of claim frequency.
+We will come back to this in the statistical approach section and see with an anova test if the 7 bins are significantly better than a reduced number of bins.
+
+- `AGEC_binned`
+
+For the age of the car, we can confirm our previous observations that brand new cars (0-1 years old) have more claims.
+We can also confir the lower risk for cars between 1 and 3 years old and above 15 years.
+The remaining question is whether the bins 1 to 2 and 2 to 3 should be merged in a single bin.
+We will revisit this question in the statistical approach section to determine if merging these bins significantly affects the model performance.
+
+- `POWER_binned`
+
+Thanks to our binning algorithm, we correctly identified the low-risk for power lower than 33 kilowatts.
+We also correctly identified the very localised peak in risk for power 50 to 51 kilowatts.
+It is not clear whether the last 3 to 4 bins should be merged or kept separate, as the risk pattern is less pronounced in this range. We will also investigate this in the statistical approach section.
 
 ### Statistical Approach
+
+We already addressed the statistical significance by visually checking the confidence intervals around the claim frequencies.
+In this statistical data exploration, we will add two anova layers onto that visual inspection: 
+
+#### Global Anova Test:
+
+We will compare the deviance of the model with the variable as single predictor to the null model with only the offset term. This will allow us to test if the variable significantly improves the model fit:
+
+$H_0: \var D = D_0 - D_1 = 0$
+$H_1: \var D = D_0 - D_1 > 0$
+
+For our test statistic we have $ \var D \sim \chi^2_{df} $, where $df$ is the difference in the number of parameters between the null and alternative models.
+
+Our $D_0$ represents the deviance of the null model with only the offset term: `glm(NCLAIMS ~ offset(log(EXP)))`.
+The $D_1$ represents the deviance of the model with the variable as a single predictor: `glm(NCLAIMS ~ offset(log(EXP)) + get(var))`.
+
+```{r null_model}
+m0 <- glm(NCLAIMS ~ offset(log(EXP)), data = data, family = poisson(link = "log"))
+sprintf("Because we use Poisson with its canonic link, note exp(Beta0) = %f is equal to the empiric claim frequency = %f", exp(coef(m0)[1]), sum(data$NCLAIMS)/sum(data$EXP))
+```
+
+Let's now compare this null model to the models with each predictor variable individually.
+
+```{r anova_comparison}
+test_level <- 0.05
+for (var in c("COVERAGE_BIN", "FUEL", "USE", "FLEET", "SEX", "BM_binned", "AGEPH_binned", "AGEC_binned", "POWER_binned")) {
+    m1 <- glm(NCLAIMS ~ offset(log(EXP)) + get(var), data = data, family = poisson(link = "log"))
+    test_result <- anova(m0, m1, test = "Chisq")
+    cat(sprintf("Is variable %s significant? %s\n", var, ifelse(test_result$`Pr(>Chi)`[2] < test_level, "Yes", "No")))
+}
+```
+
+With this first global anova test, we confirm our graphical approach, all variables should be kept except for `USE`.
+
+#### Merged bins
+
+Let's take the example of `COVERAGE` where we decided to merge the two omnium levels. 
+Can we justify this statistically with the ANOVA test instead of simply with the confidence intervals?
+
+```{r merge_coverage}
+m0 <- glm(NCLAIMS ~ offset(log(EXP)) + COVERAGE_BIN, data = data, family = poisson(link = "log"))
+m1 <- glm(NCLAIMS ~ offset(log(EXP)) + COVERAGE, data = data, family = poisson(link = "log"))
+test_result <- anova(m0, m1, test = "Chisq")
+pval <- test_result$`Pr(>Chi)`[2]
+sprintf("Was it justified to merge the COVERAGE bins? %s", ifelse(pval < 0.05, "No", "Yes"))
+sprintf("Are you 99%% sure that it was not justified? %s", ifelse(pval < 0.01, "Yes", "No"))
+```
+
+Because the p-value is `r pval`, we can conclude that we reject the hypothesis that the deviance was different between the merged and unmerged COVERAGE bins at a 95% confidence level but not at a 99% confidence level.
+It was therefore not a bad idea to merge the COVERAGE bins based on our graphical analysis based on confidence intervals.
+
+We can apply the same reasoning to clarify whether or not we should merge:
+
+- The last 3 bins of `AGEPH_binned`
+
+```{r merge_agephb}
+data$AGEPH_binned_merged <- fct_collapse(
+    data$AGEPH_binned, 
+    "(66,95]" = c("(66,68]", "(68,71]", "(71,95]")
+)
+
+m0 <- glm(NCLAIMS ~ offset(log(EXP)) + AGEPH_binned, data = data, family = poisson(link = "log"))
+m1 <- glm(NCLAIMS ~ offset(log(EXP)) + AGEPH_binned_merged, data = data, family = poisson(link = "log"))
+test_result <- anova(m0, m1, test = "Chisq")
+pval <- test_result$`Pr(>Chi)`[2]
+
+if(pval < 0.05) {
+    cat(sprintf("Merging the last 3 bins of AGEPH_binned was not justified (p-value = %f).\n", pval))
+} else {
+    cat(sprintf("Merging the last 3 bins of AGEPH_binned was justified (p-value = %f).\n", pval))
+    plot(plot_claim_freq(data, "AGEPH_binned_merged"))
+}
+```
+
+- The bins 1-2 and 2-3 of `AGEC_binned`
+
+```{r merge_agec}
+data$AGEC_binned_merged <- fct_collapse(
+    data$AGEC_binned, 
+    "(1,3]" = c("(1,2]", "(2,3]")
+)
+
+m0 <- glm(NCLAIMS ~ offset(log(EXP)) + AGEC_binned, data = data, family = poisson(link = "log"))
+m1 <- glm(NCLAIMS ~ offset(log(EXP)) + AGEC_binned_merged, data = data, family = poisson(link = "log"))
+test_result <- anova(m0, m1, test = "Chisq")
+pval <- test_result$`Pr(>Chi)`[2]
+
+if(pval < 0.05) {
+    cat(sprintf("Merging the second and third bins of AGEC_binned was not justified (p-value = %f).\n", pval))
+} else {
+    cat(sprintf("Merging the second and third bins of AGEC_binned was justified (p-value = %f).\n", pval))
+    plot(plot_claim_freq(data, "AGEC_binned_merged"))
+}
+```
+
+- The last 3 or last four bins of `POWER_binned`
+
+```{r merge_power}
+levels(data$POWER_binned)
+
+```
+```{r merge_power}
+data$POWER_binned_merged <- fct_collapse(
+    data$POWER_binned, 
+    "(51,243]" = c("(51,66]", "(66,83]", "(83,99]", "(99,243]")
+)
+
+m0 <- glm(NCLAIMS ~ offset(log(EXP)) + POWER_binned, data = data, family = poisson(link = "log"))
+m1 <- glm(NCLAIMS ~ offset(log(EXP)) + POWER_binned_merged, data = data, family = poisson(link = "log"))
+test_result <- anova(m0, m1, test = "Chisq")
+pval <- test_result$`Pr(>Chi)`[2]
+
+if(pval < 0.05) {
+    cat(sprintf("Merging the last 4 bins of POWER_binned was not justified (p-value = %f).\n", pval))
+    data$POWER_binned_merged <- fct_collapse(
+        data$POWER_binned, 
+        "(66,243]" = c("(66,83]", "(83,99]", "(99,243]")
+    )
+
+    m0 <- glm(NCLAIMS ~ offset(log(EXP)) + POWER_binned, data = data, family = poisson(link = "log"))
+    m1 <- glm(NCLAIMS ~ offset(log(EXP)) + POWER_binned_merged, data = data, family = poisson(link = "log"))
+    test_result <- anova(m0, m1, test = "Chisq")
+    pval <- test_result$`Pr(>Chi)`[2]
+
+    if(pval < 0.05) {
+        cat(sprintf("And merging the last 3 bins of POWER_binned was not justified either (p-value = %f).\n", pval))
+    } else {
+        cat(sprintf("But merging the last 3 bins of POWER_binned was justified (p-value = %f).\n", pval))
+        plot(plot_claim_freq(data, "POWER_binned_merged"))
+    }
+} else {
+    cat(sprintf("Merging the last 4 bins of POWER_binned was justified (p-value = %f).\n", pval))
+    plot(plot_claim_freq(data, "POWER_binned_merged"))
+}
+```
+
+We have now have thoroughly examined the data we had available exced for the `TOWN` and `PC` variables.
+We will come back to them in the feature engineering section.
 
 ## Feature Engineering
 
