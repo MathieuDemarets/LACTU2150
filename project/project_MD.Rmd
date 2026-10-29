@@ -25,6 +25,7 @@ knitr::opts_chunk$set(
     echo = TRUE,
     warning = FALSE,
     message = FALSE,
+    comment = NA,
     fig.width = 7,
     fig.height = 4.7,
     fig.align = "center"
@@ -38,6 +39,7 @@ if (!require("kableExtra")) install.packages("kableExtra")
 if (!require("knitr")) install.packages("knitr")
 if (!require("ggplot2")) install.packages("ggplot2")
 if (!require("plotly")) install.packages("plotly")
+if (!require("patchwork")) install.packages("patchwork")
 
 
 library(dplyr)
@@ -46,24 +48,163 @@ library(kableExtra)
 library(knitr)
 library(ggplot2)
 library(plotly)
+library(patchwork)
 ```
 
 # Executive Summary
 
 # Data Preparation
 
-```{r data_loading}
+## Overview of the Dataset
+
+The first step of the data exploration process is to load the insurance claims of our Belgian Motor Third Party Liability (MTPL) dataset.
+We will start ensuring the uniqueness of keys. Then, we'll have a look at our target variables and the distribution of the exposure.
+Finally, we will have a quick look at the predictor variables we have before diving in the data transformation and exploration.
+
+<br>
+
+### Uniqueness of Keys
+
+Each row in the dataset represents a unique insurance policy (`ID`). We can verify the uniqueness of rows by checking if the number of unique `ID`s matches the total number of rows.
+```{r uniqueness_of_rows, comment=NA}
 setwd(paste0(
     "C:/Users/MathieuDemarets/Documents/UCL Certificat/",
     "CodeRepositories/LACTU2150/project"
 ))
 load("../data/mtpl_be.rda")
 data <- mtpl_be
+
+n_unique_ids <- length(unique(data$ID))
+n_rows <- nrow(data)
+cat(sprintf(
+    "Number of unique IDs: %d\nNumber of rows: %d\nAre they equal? %s", 
+    n_unique_ids, n_rows, 
+    ifelse(n_unique_ids == n_rows, "Yes", "No")
+))
 ```
 
-## Data Transformation
+<br>
 
-### Categorical Variables
+### Target Variables
+
+For each policy, we have an exposure (`EXP`), which represents the fraction of the year that the policy was in force. The contract last a single year at most. Over that exposure time, we have the two target variables: 
+
+- **Frequency (`NCLAIMS`)**: The number of claims filed during the policy period.
+- **Severity (`AVG`)**: The average cost per claim during the policy period.
+
+The total claim cost is derived from the frequency and severity:
+
+- **Total Claim Cost (`NCLAIMS * AVG = AMOUNT`)**: The total cost of claims during the policy period.[^amount]
+
+[^amount]: For policies with no claims, `AMOUNT` is zero; `AVG` is undefined.
+
+```{r Exposure}
+qtable <- function(data, x, n_quant) {
+    data_not_na <- data[!is.na(data[[x]]), ]
+    if (sum(is.na(data[[x]])) > 0) warning(sprintf("Removing %d NA values from column %s", sum(is.na(data[[x]])), x))
+    # Get the n_quantiles of the column x
+    qx <- quantile(data_not_na[[x]], probs = seq(0, 1, by = 1 / n_quant))
+    quantiles <- data.frame(Quantile = names(qx), Value = as.numeric(qx))
+    quantiles$Value <- format(quantiles$Value, big.mark = ",", format = "f", digits = 2, scientific = FALSE)
+    rownames(quantiles) <- quantiles$Quantile
+    quantiles$Quantile <- NULL    
+    quantiles %>% t() %>% as.data.frame() %>% kable(
+    caption = sprintf("Quantiles of %s", x),
+    booktabs = FALSE
+    ) %>% kableExtra::kable_styling(full_width = FALSE, position = "left")
+}
+```
+
+
+```{r claims_distribution}
+qtable(data, "NCLAIMS", 10)
+
+p1 <- ggplot(data, aes(x = NCLAIMS)) +
+    geom_bar() +
+    labs(
+        title = "NCLAIMS Distribution",
+        x = "Number of Claims",
+        y = sprintf("Count (All: %d)", nrow(data))
+    ) +
+    theme_minimal()
+
+qtable(data, "AVG", 10)
+
+filtered_AVG <- data %>% filter(!is.na(AVG))
+
+p2 <- ggplot(filtered_AVG, aes(x = log(AVG))) +
+    geom_histogram(bins = 30) +
+    labs(
+        title = "AVG Distribution",
+        x = "Log of Average Claim Cost",
+        y = sprintf("Count (All: %d)", nrow(filtered_AVG))
+    ) +
+    theme_minimal()
+
+qtable(data, "AMOUNT", 10)
+
+filtered_AMOUNT <- data %>% filter(!is.na(AMOUNT))
+p3 <- ggplot(filtered_AMOUNT, aes(x = AMOUNT)) +
+    geom_histogram(bins = 30) +
+    labs(
+        title = "AMOUNT Distribution",
+        x = "Total Claim Amount",
+        y = sprintf("Count (All: %d)", nrow(filtered_AMOUNT))
+    ) +
+    theme_minimal()
+
+
+(p1 | p3 )/ p2
+```
+
+For both the frequency and severity of claims, we observe a large distribution mass around zero. This is quite typical in insurance data, where many policies have no claims or very low average claim costs. We also note that `r sum(is.na(data$AVG))` policies have missing average claim costs.
+This is simply because no claims were reported for these policies (`r sum(data$NCLAIMS == 0)` policies with no claims). The claim amount is by nature zero in this case, and the average ($\frac{AMOUNT}{NCLAIMS}$) is undefined and not informative. When we will tackle the modeling of claim severity, we will therefore focus only on policies with at least one claim.
+To handle unbalanced data in the frequency modelling, various techniques are available such as:
+
+- Synthetic oversampling techniques (e.g., SMOTE) create synthetic samples for the minority class to balance the dataset.
+- Hurdle models can be employed to separately model the zero and non-zero counts, effectively handling the excess zeros in the data and focusing on the non-zero records in the second part of the model.
+
+These are outside the scope of this analysis, it is nevertheless important to note that this unbalance will limit the frequency modelling performance and that these techniques could be explored in the future.
+
+We can also note that the distribution of average claim is more interesting to look at. Indeed, we exclude policies with no claims, as their average claim is undefined. Then, we can take the logarithm of the average claim to better visualize the scale of cost instead of the absolute values.
+The quantiles indeed show us a very skewed distribution, with most average claims being relatively low but a few policies having very high average claims. We can see two peaks in the log-transformed average claim distribution which indicates the presence of different kind of claims:
+
+- First peak corresponds to small dents and repairs: the log around 5 represents claims of approximately `r sprintf("%.0f euros", exp(5))`
+- Second peak corresponds to more significant repairs: the log around 7.5 represents claims of approximately `r sprintf("%.0f euros", exp(7.5))`
+- Right tail corresponds to way bigger damages: the log around 10 represents claims of approximately `r sprintf("%.0f euros", exp(10))`
+
+Even if they are not so frequent, the larger claims in the right tail can have a significant impact on the company profitability. A future report could use `Extreme Value Theory` to better model and understand these rare but impactful claims.
+
+```{r exposure_distribution}
+qtable(data, "EXP", 10)
+```
+
+Regarding the exposure, we see that a large majority of the policies have an exposure close to 1, indicating that most policies are active for nearly the entire year.
+About `r 1-round(sum(data$EXP == 1) / nrow(data), 2)` of the policies have an exposure less than 1. This does not suggest that an analysis per exposure level is necessary.
+
+Exposure should still be considered to correctly estimate the claim frequency as counting full exposure would underestimate the risk.
+The correct way to compute the mean claim frequency is $$\frac{\sum{NCLAIMS}}{\sum{EXP}}, \text{ where } EXP \in [0, 1]$$ will therefore be hugher than the naive mean $$\frac{\sum{NCLAIMS}}{nrow(data) = \sum{1}}$$
+```{r mean_frequency}
+mean_claim_frequency <- sum(data$NCLAIMS) / sum(data$EXP)
+se_mean <- sqrt(mean_claim_frequency / sum(data$EXP))
+ic_99 <- mean_claim_frequency + c(-1, 1) * 2.576 * se_mean
+wrong_mean <- mean(data$NCLAIMS)
+cat(sprintf(
+    "Correct mean claim frequency: %.3f%% (99%% CI: [%.3f%%, %.3f%%])\nNaive mean: %.3f%%",
+    mean_claim_frequency * 100,
+    ic_99[1] * 100,
+    ic_99[2] * 100,
+    wrong_mean * 100
+))
+```
+
+This confirms that the naive mean of `NCLAIMS` falls short of the 99% confidence interval for the correct mean claim frequency. It is therefore crucial to account for the exposure through the offset[^offset] in the frequency modelling.
+
+[^offset]: In frequency modelling, the exposure is typically included as an offset in the model to adjust for the varying lengths of policy coverage. This ensures that the estimated claim frequency accurately reflects the risk per unit of exposure rather than per policy.
+
+<br>
+
+### All Variables
 
 ```{r initial_data_overview}
 col_types <- sapply(data, class)
@@ -78,34 +219,47 @@ knitr::kable(
                 counts <- sort(table(x), decreasing = TRUE)
                 names(counts)[1]
             }
-        })
+        }),
+        Missing = sapply(data, function(x) sum(is.na(x)))
     ),
-    caption = "Overview of variable types in the insurance claims dataset",
+    caption = "Overview of variable in the insurance claims dataset",
     booktabs = TRUE
 ) %>% kableExtra::kable_styling(full_width = TRUE, position = "left")
 ```
 
-From this initial data loading, we can already notice that some columns have been asigned the wrong type:
+From this basic overview, we can confirm a few key points:
+
+- `ID`: all rows indeed have an identifier (no missing values) and we saw before that it is unique for each row.
+- `NCLAIMS`: the mean value of `r sprintf("%.3f%%", wrong_mean * 100)` is **NOT** the correct mesure of risk over the exposition and should be adjusted by the exposure `EXP` to get `r sprintf("%.3f%%", mean_claim_frequency * 100)`.
+- `AMOUNT`: the average loss amount of `r sprintf("%.3f euros", mean(data$AMOUNT, na.rm = TRUE))` hides very different realities between no-claim, low-ticket, medium, and high-ticket claims as we established earlier.
+- `AVG`: the average claim cost is higher than the average loss amount which seems counterintuitive at first, but it reflects the fact that `AVG` is calculated only for policies with claims, whereas `AMOUNT` includes all policies, including those with no claims as we see with the number of missing values in `NCLAIMS` corresponding to policies with no claims as discussed earlier.
+
+We can also notice that some columns have been asigned the wrong type:
 
 - **COVERAGE, FUEL, USE, FLEET, SEX, and TOWN** should be set as unordered factor variables instead of character variables.
 - **PC** should be converted from integer to an unordered factor variable.
-- **BM** is the bonus-malus level and a higher score indicates a worse claim history, but the differences between levels are not necessarily uniform. We will thus treat it as an ordered factor variable.
 
-We will also make sure that the reference levels are correctly set for the factor variables:
+This leads us to our next section on data transformation.
 
-- Most frequent level for unordered factor variables
-- Lowest level for ordinal factor variables
+
+## Data Transformation
+
+### Categorical Variables
+
+As concluded at the end of the last section, we need to transform some character variables to factor variables.
+We will also make sure that the most frequent level (Center in the previous overview) is set as the reference level for unordered factor variables.
 
 ```{r set_types}
 for (col in c("COVERAGE", "FUEL", "USE", "FLEET", "SEX", "TOWN", "PC")) {
     data[[col]] <- as.factor(data[[col]]) %>% fct_infreq()
 }
-data[["BM"]] <- factor(data[["BM"]], ordered = TRUE)
 ```
 
-We can then assert that the categorical variables (ordered or unordered) have the correct reference levels.
+We can then assert that the categorical variables (ordered or unordered) have the correct reference levels. Note that our function also checks for ordered factor variables, ensuring that the reference level is the lowest level in this case.
+This does not happen in our dataset. The variable `BM` could be considered as unordered as we know that a higher `BM` score indicates a more risky driver but we don't know if the jumps between the levels are constant. 
+We decided to treat it as numerical because the numeric variable will be binned with a weight of evidence (WoE) approach and it will yield more meaningful bins than simple singleton bins.
 
-```{r assert_ref_levels, results='asis'}
+```{r assert_ref_levels}
 assert_ref_level <- function(data, cols) {
     for (col in cols) {
         if (!is.factor(data[[col]])) stop(paste(col, "is not a factor variable"))
@@ -128,30 +282,45 @@ assert_ref_level <- function(data, cols) {
             }
     }
     }
-    cat("> Reference levels for", paste(cols, collapse = ", "), "are correctly set\n")
+    cat("Reference levels for", paste(cols, collapse = ", "), "are correctly set\n")
 }       
-assert_ref_level(data,  c("COVERAGE", "FUEL", "USE", "FLEET", "SEX", "TOWN", "PC", "BM"))
+assert_ref_level(data,  c("COVERAGE", "FUEL", "USE", "FLEET", "SEX", "TOWN", "PC"))
 ```
 
 ### Numerical Variables Binning
 
+For the initial `GLM` modeling, we will need to discretize the continuous numerical variables into bins. We will use the same binning strategy for discrete variables to reduce the amount of bins and simplify the model interpretation.
 Defining optimal binning for a numerical variable is a complex and important step. There are a set of naive approaches that can be used:
 
 - Singleton bins: Each unique value of the numerical variable is treated as a separate bin.
 - Equal-width bins: The range of the variable is divided into intervals of equal width.
 - Equal-frequency bins: Quantiles of the variable are used to create bins with approximately the same number of observations.
 
-For this project, we will try to implement a small algorithm based on weight of evidence (WoE) to automatically determine a suitable binning for numerical variables. The idea of WoE binning is to group values based on how strongly
-they are associated with the target variable (binary outcome encoded as 0 if claim = 0 and 1 if claim >= 1):
+For this project, we will try to implement a more complex approach based on weight of evidence (WoE) to automatically determine a suitable binning for numerical variables. 
+The idea of WoE binning is to group values based on how strongly they are associated with the target variable (binary outcome encoded as 0 if claim = 0 and 1 if claim >= 1):
 
 $$
 \text{WoE} = \ln \frac{\text{proportion of Good Outcomes in the bin}}{\text{proportion of Bad Outcomes in the bin}}
 $$
 
-1. Use a quantile-based binning as baseline
+Based on the WoE values, we can also compute the information value (IV) for each variable, which measures the predictive power of the variable with respect to the target. The IV is calculated as:
 
-The function `qbinning` is a simple algorithm that will start from the maximum number of bins specified by `max_bins` and iteratively reduce the number of bins until each bin contains at least one claim.
-This will ensure that the weight of evidence (WoE) can be calculated for each bin, as each bin will have at least one claim.
+$$
+\text{IV} = \sum (\text{proportion of Good Outcomes in the bin} - \text{proportion of Bad Outcomes in the bin}) \times \text{WoE}
+$$
+
+The IV value helps to assess the predictive power of a variable for the binning we have chosen. The idea of the algorithm will be to:
+
+- Start with an adapted quantile-based binning as a baseline with a maximum number of bins specified.
+- Iteratively merge bins based on bins with minimal information value (IV) contribution and assess total IV after each merge.
+- Find the elbow point where the marginal contribution of one additional bin to the total IV decreases significantly.
+
+We will take that elbow point and its associated bins boundaries for the final binning of the variable. We will detail each step of the algorithm with an example using the `AGEPH` variable.
+
+#### Baseline Quantile Binning
+
+Our function `qbinning` is a simple algorithm that will start from the maximum number of bins specified by `max_bins` and iteratively reduce the number of bins until each bin contains at least one claim.
+This will ensure that the weight of evidence (WoE) can be calculated for each bin, as each bin will have at least one claim. We'll then avoid having an undefined WoE.
 
 ```{r quantile_binning}
 qbinning <- function(data, x, y, max_bins = 10) {
@@ -183,10 +352,10 @@ qbinning <- function(data, x, y, max_bins = 10) {
 ```
 
 ```{r example_quantile_binning}
-bins_power <- qbinning(data, x = "POWER", y = "NCLAIMS", max_bins = 30)
+bins_ageph <- qbinning(data, x = "AGEPH", y = "NCLAIMS", max_bins = 30)
 counts <- tapply(
     data[["NCLAIMS"]],
-    cut(data[["POWER"]], bins_power, include.lowest = TRUE),
+    cut(data[["AGEPH"]], bins_ageph, include.lowest = TRUE),
     function(z) sum(z >= 1)
 )
 
@@ -196,17 +365,19 @@ df_bins <- data.frame(
 )
 
 p <- ggplot(df_bins, aes(x = bin, y = count)) +
-ggtitle("Baseline Quantile Binning (POWER)") +
+ggtitle("Baseline Quantile Binning (AGEPH)") +
 geom_col(fill = "steelblue") +
-labs(x = "POWER baseline quantile bin", y = "Policies with at least one claim") +
+labs(x = "AGEPH baseline quantile bin", y = "Policies with at least one claim") +
 theme_minimal() +
 theme(axis.text.x = element_text(angle = 60, hjust = 1))
 ggplotly(p)
 ```
 
-2. Weight of Evidence (WoE) Calculation
+Starting with 30 quantile bins, we apply our tweaked function `qbinning` to the `AGEPH` variable and find these `r length(bins_ageph) - 1` bins with somepolicies having at least one claim.
 
-Based on the formula above, the weight of evidence (WoE) for each bin can be calculated as the natural logarithm of:
+#### Weight of Evidence (WoE) and Information Value (IV) Calculation
+
+Based on the formula presented above, the weight of evidence (WoE) for each bin can be calculated as the natural logarithm of:
 
 - $\text{proportion of Good Outcomes in the bin} = \frac{\text{Number of Good Outcomes in the bin}}{\text{Total Number of Good Outcomes}}$
 - $\text{proportion of Bad Outcomes in the bin} = \frac{\text{Number of Bad Outcomes in the bin}}{\text{Total Number of Bad Outcomes}}$
@@ -214,6 +385,10 @@ Based on the formula above, the weight of evidence (WoE) for each bin can be cal
 If the bin has as much good (no claim) as bad (at least one claim) outcomes, the WoE will be zero as there is very little predictive power in that bin.
 If the bin has more good outcomes than bad outcomes, the WoE will be positive, indicating that the bin is associated with a lower risk. 
 Finally, if the bin has more bad outcomes than good outcomes, the WoE will be negative, indicating that the bin is associated with a higher risk.
+
+The Information Value (IV) is a measure based on the Weight of Evidence (WoE) that quantifies the predictive power of a feature in distinguishing between good and bad outcomes. It is calculated as:
+
+$$\text{IV} = \sum_{\text{bins}} (\text{proportion of Good Outcomes in the bin} - \text{proportion of Bad Outcomes in the bin}) \times \text{WoE of the bin}$$
 
 ```{r woe_calculation}
 woe_calc <- function(data, x, y, bins) {
@@ -237,7 +412,7 @@ woe_calc <- function(data, x, y, bins) {
     return(binned_woe_df)
 }
 
-plot_woe_iv <- function(woe_df) {
+plot_woe_iv <- function(woe_df, interactive = TRUE) {
     max_woe <- max(abs(woe_df$woe))
     max_iv <- max(abs(woe_df$iv))
     # Avoid dividing by zero when all values are zero
@@ -272,23 +447,80 @@ plot_woe_iv <- function(woe_df) {
             axis.text.x = element_text(angle = 60, hjust = 1),
         ) +
         ggtitle(
-            paste0("WoE and IV by Bin (bins=", length(woe_df$bin), ")")
+            paste0("WoE and IV (bins=", length(woe_df$bin), ")")
         )
-    ggplotly(p)
+    if (interactive) {
+        ggplotly(p)
+    } else {
+        return(p)
+    }
 }
 ```
 
 ```{r example_woe_calculation}
-woe_ex <- woe_calc(data, x = "POWER", y = "NCLAIMS", bins = bins_power)
+woe_ex <- woe_calc(data, x = "AGEPH", y = "NCLAIMS", bins = bins_ageph)
 plot_woe_iv(woe_ex)
 ```
 
-3. Optimize based on the Information Value (IV)
+The example for `AGEPH` already shows very interesting patterns for our baseline binning:
 
-The Information Value (IV) is a measure based on the Weight of Evidence (WoE) that quantifies the predictive power of a feature in distinguishing between good and bad outcomes. It is calculated as:
+- The WoE values go from negative to positive, indicating that the younger age groups have a higher likelihood of bad outcomes (at least one claim) compared to the older age groups.
+- The IV line shows a very high contribution from the young and older age groups, indicating that these bins are the most predictive for the likelihood of claims.
+
+Let's confirm the relationship between age and number of claims by examining correlation between `AGEPH` and `NCLAIMS` and visualizing it.
+
+```{r age_claims_correlation}
+# boxplot of age for each number of claims
+boxplot(AGEPH ~ NCLAIMS, data = data, xlab = "NCLAIMS", ylab = "AGEPH", main = "Boxplot of AGEPH by NCLAIMS")
+# claim frequency in our example bins, group by bin
+age_quantiles <- cut(data$AGEPH, breaks = bins_ageph, include.lowest = TRUE)
+gpd_data <- data %>% 
+    mutate(age_bin = age_quantiles) %>% 
+    group_by(age_bin) %>% 
+    summarise(
+        sum_exp = sum(EXP),
+        sum_claims = sum(NCLAIMS),
+        lambda = sum_claims / sum_exp,
+        sd_lambda = sqrt(lambda / sum_exp),
+        lambda_95_lower = lambda - 1.96 * sd_lambda,
+        lambda_95_upper = lambda + 1.96 * sd_lambda,
+        lambda_99_lower = lambda - 2.58 * sd_lambda,
+        lambda_99_upper = lambda + 2.58 * sd_lambda
+    )
+# Plot the claim frequency (lambda) with filled error bars 95 and 99 percent confidence intervals
+p2 <- ggplot(gpd_data, aes(x = age_bin, group = 1)) +
+    geom_ribbon(
+        aes(ymin = lambda_99_lower, ymax = lambda_99_upper),
+        fill = "gray", alpha = 0.3, label = "99% CI"
+    ) +
+    geom_ribbon(
+        aes(ymin = lambda_95_lower, ymax = lambda_95_upper),
+        fill = "lightblue", alpha = 0.5, label = "95% CI"
+    ) +
+    geom_line(aes(y = lambda), color = "black") +
+    geom_point(aes(y = lambda), color = "black") +
+    theme_minimal() +
+    scale_y_continuous(labels = scales::comma) +
+    labs(
+        x = "Age Bin",
+        y = "Claim Frequency (Lambda)",
+        title = "Claim Frequency by Age Bin"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggplotly(p2)
+```
+
+The boxplots show that the group of policyholders with lower amount of claims do tend to be older. It is even more striking when we look at the claim frequency by age bin with the confidence intervals[^CI].
+
+[^CI]: The confidence intervals are based on the MLE estimator for the claim frequency under the assumption of a Poisson distribution for the number of claims.
+
+#### Iterative Merging Based on Information Value (IV)
+
+Remember that the Information Value (IV) is a measure based on the Weight of Evidence (WoE) that quantifies the predictive power of a feature in distinguishing between good and bad outcomes. It is calculated as:
 
 $$\text{IV} = \sum_{\text{bins}} (\text{proportion of Good Outcomes in the bin} - \text{proportion of Bad Outcomes in the bin}) \times \text{WoE of the bin}$$
 
+We have an information value for each bin, which allows us to identify the adjacent bins that contribute the least to the overall predictive power and merge them iteratively.
 The goal is to recursively merge the bin with lowest IV contribution with its neighboring bin, and evaluate the resulting IV. Then we can find the elbow point where further merging would lead to a significant loss of predictive power.
 
 ```{r iv_algorithm}
@@ -339,7 +571,7 @@ iv_elbow <- function(data, x, y, bins) {
     iter_log$diff_order <- rank(-iter_log$diff)
     return(iter_log)
 }
-plot_iv_elbow <- function(iv_elbow_result) {
+plot_iv_elbow <- function(iv_elbow_result, interactive = TRUE) {
     first_max_diff <- filter(iv_elbow_result, diff_order == 1)
     p <- ggplot(iv_elbow_result, aes(x = n_bins, y = iv)) +
         geom_line() +
@@ -348,14 +580,21 @@ plot_iv_elbow <- function(iv_elbow_result) {
         theme_minimal() +
         geom_vline(xintercept = first_max_diff$n_bins, linetype = "dashed", color = "red") +
         geom_hline(yintercept = first_max_diff$iv, linetype = "dashed", color = "red")
-    ggplotly(p)
+    if (interactive) {
+        ggplotly(p)
+    } else {
+        return(p)
+    }
 }
 ```
 
 ```{r iv_elbow_result}
-result <- iv_elbow(data, "POWER", "NCLAIMS", bins_power)
-plot_iv_elbow(result)
+result <- iv_elbow(data, "AGEPH", "NCLAIMS", bins_ageph)
+plot_iv_elbow(result, interactive = TRUE)
 ```
+
+Looking at the IV elbow plot and taking the number of bins corresponding to the first maximum difference in IV as the optimal choice, we can rebuild the bins with only two bins. Adding a single bin seems sensible as we capture more information with a single additional split.
+We could also consider 7 or 12 bins that mark other levels in the IV - Number of Bins relationship.
 
 ```{r rebuild_bins}
 rebuild_bins <- function(iv_elbow_result, n) {
@@ -367,18 +606,287 @@ rebuild_bins <- function(iv_elbow_result, n) {
 ```
 
 ```{r rebuild_bins_result}
-opt_bins <- rebuild_bins(result, filter(result, diff_order == 1)$n_bins)
-woe_ex <- woe_calc(data, x = "POWER", y = "NCLAIMS", bins = opt_bins)
-plot_woe_iv(woe_ex)
+plots <- list()
+for (i in c(2, 3, 7, 12)) {
+    temp_bins <- rebuild_bins(result, i)
+    woe_temp <- woe_calc(data, x = "AGEPH", y = "NCLAIMS", bins = temp_bins)
+    plots[[i]] <- plot_woe_iv(woe_temp, interactive = FALSE)
+}
+(plots[[2]] | plots[[3]] ) / (plots[[7]] | plots[[12]])
 ```
 
-### Statistical Approach
+Based on the comparison above, the optimal amount of bins seems to be 7 because:
 
+- We capture in fine granularity the effet of young ages with higher risk.
+- We skip the middle of the age distribution which brings no additional information (28 to 66).
+- We capture the effect of older ages with lower risk profiles with good granularity.
+- We see that last effect fading slightly for the oldest ages (above 71)
 
+The complex pattern we noticed in our initial `r length(bins_ageph) - 1` bins seems to be well captured with 7 bins only.
+
+```{r binned_numerical}
+# We add the ordered factor variable for the binned AGEPH
+data$AGEPH_binned <- cut(
+    data$AGEPH, 
+    breaks = rebuild_bins(result, 7), include.lowest = TRUE, ordered_result = TRUE)
+# Check the distribution of the binned variable
+summary(data$AGEPH_binned) %>%
+    kable(
+        caption = "Distribution of binned AGEPH",
+        booktabs = TRUE
+    )
+```
+
+#### Bonus-Malus Binning (BM)
+
+```{r bm_binning}
+baseline_bm <- qbinning(data, x = "BM", y = "NCLAIMS", max_bins = 30)
+result_bm <- iv_elbow(data, "BM", "NCLAIMS", baseline_bm)
+plot_iv_elbow(result_bm, interactive = TRUE)
+```
+
+Based on the Elbow plot for the Bonus-Malus (`BM`), let's try 3, 4, 5, and 11 bins.
+
+```{r rebuild_bins_bm}
+plots_bm <- list()
+for (i in c(3, 4, 5, 11)) {
+    temp_bins_bm <- rebuild_bins(result_bm, i)
+    woe_temp_bm <- woe_calc(data, x = "BM", y = "NCLAIMS", bins = temp_bins_bm)
+    plots_bm[[i]] <- plot_woe_iv(woe_temp_bm, interactive = FALSE)
+}
+(plots_bm[[3]] | plots_bm[[4]] ) / (plots_bm[[5]] | plots_bm[[11]])
+```
+
+We see that most information is captured by the first bin indicating that those with a BM of 0 are significantly safer than the others.
+The three bins are sufficient to capture the separate the first and second risk groups that are the first and second half of the BM score.
+Adding bins just creates bins in between with low informational value.
+
+```{r adding_binned_bm}
+data$BM_binned <- cut(
+    data$BM,
+    breaks = rebuild_bins(result_bm, 3), include.lowest = TRUE, ordered_result = TRUE)
+```
+
+#### Age of the Car Binning (AGEC)
+
+```{r agec_binning}
+baseline_agec <- qbinning(data, x = "AGEC", y = "NCLAIMS", max_bins = 30)
+result_agec <- iv_elbow(data, "AGEC", "NCLAIMS", baseline_agec)
+plot_iv_elbow(result_agec, interactive = TRUE)
+```
+
+For the age of the car (`AGEC`), we see a plateau after around 5 bins, let's compare 3, 4, 5, and 16 (max) bins.
+
+```{r rebuild_bins_agec}
+plots_agec <- list()
+for (i in c(3, 4, 5, 16)) {
+    temp_bins_agec <- rebuild_bins(result_agec, i)
+    woe_temp_agec <- woe_calc(data, x = "AGEC", y = "NCLAIMS", bins = temp_bins_agec)
+    plots_agec[[i]] <- plot_woe_iv(woe_temp_agec, interactive = FALSE)
+}
+(plots_agec[[3]] | plots_agec[[4]]) / (plots_agec[[5]] | plots_agec[[16]])
+
+```
+
+The maximum binning shows us a clear separation of risk between:
+
+- Brand new cars (AGEC close to 0) have the highest risk.
+- Older cars (AGEC over 15 years) have a lower risk.
+
+This is captured from 3 bins onward. Using 5 bins would allow us to capture the low-risk group for cars of 1 to 3 years old separately from the older low-risk cars.
+These cars are typically good new cars with conductors that have had the time to get used to them. We will thereforeuse 5 bins for the age of the car.
+
+```{r adding_binned_agec}
+data$AGEC_binned <- cut(
+    data$AGEC,
+    breaks = rebuild_bins(result_agec, 5)
+    , include.lowest = TRUE, ordered_result = TRUE)
+```
+
+#### Power Binning (POWER)
+
+```{r power_}
+baseline_power <- qbinning(data, x = "POWER", y = "NCLAIMS", max_bins = 30)
+result_power <- iv_elbow(data, "POWER", "NCLAIMS", baseline_power)
+plot_iv_elbow(result_power, interactive = TRUE)
+```
+
+For the power of the car (`POWER`), we have stairs at 5, 7, and 12 bins. We'll compare these three steps with the max level of bins (23).
+
+```{r rebuild_bins_power}
+plots_power <- list()
+for (i in c(5, 7, 12, 23)) {
+    temp_bins_power <- rebuild_bins(result_power, i)
+    woe_temp_power <- woe_calc(data, x = "POWER", y = "NCLAIMS", bins = temp_bins_power)
+    plots_power[[i]] <- plot_woe_iv(woe_temp_power, interactive = FALSE)
+}
+(plots_power[[5]] | plots_power[[7]]) / (plots_power[[12]] | plots_power[[23]])
+
+```
+
+The power constribution is harder to interpret. We have the low-power cars that are safer (lower claims), and high power that are more dangerous (higher claims). The middle range is not as clear.
+We notice two informative risk pockets (bins=12). A quick web search indicates these interpretations [^disclaimer]:
+
+- Power between 44 and 47: this is the minimum legal and practical power for modern highway-legal cars. Below this range, cars are typically underpowered for regular driving conditions.
+- Power between 50 and 51: this is widely considered the mechanical sweet spot to maintain highway speed withouf sacrificing fuel economy in urban driving. It is typically a marker of entry-level city cars.
+
+Based on this interpretation, the power could be a proxy for the type of car and its urban usage. We will use 7 bins to account for the identification of entry-level city cars without overcomplicating the model with too many bins.
+
+[^disclaimer]: The interpretations are the result of google IA's search and should be taken with caution. A true market research and assessment of the hidden factors is outside the scope of this assignment.
+
+```{r adding_binned_power}
+data$POWER_binned <- cut(
+    data$POWER,
+    breaks = rebuild_bins(result_power, 7)
+    , include.lowest = TRUE, ordered_result = TRUE)
+```
+
+We will end this Data Transformation section here now that we have bins for both categorical and numerical variables.
+
+## Data Exploration
 
 ### Graphical Approach
 
-### Machine Learning Approach
+Based on all created bins, we can visualize the claim frequency across different bins for each variable. This is what we already did in our analysis of the relation between the age of the driver and claim frequency.
+Remember that the MLE (Maximum Likelihood Estimator) for the claim frequency based on the hypothesis that the claims follow a Poisson distribution is the following:
+
+$$ NCLAIMS \sim \text{Poisson}(e\times \lambda) \text{, where } e \text{ is the exposure and } \lambda \text{ is the claim frequency rate.} $$
+$$ \hat{\lambda} = \frac{\sum NCLAIMS}{\sum e} $$
+$$ \hat{\lambda} \sim \text{Normal}\left(\lambda, \frac{\lambda}{\sum_i d_i}\right) $$
+
+We find the variance as the inverse of the fisher information (itself equal to $-\ell''(\widehat{\lambda})$)
+$$ \text{Var}(\widehat{\lambda}) \approx \I(\widehat{\lambda})^{-1} = \frac{\widehat{\lambda}}{\sum_i d_i}. $$
+
+Based on this mathematical understanding, we can build a main plot which shows exposures, claims, and claim frequencies with their confidence intervals (95 and 99%) across different bins for each variable.
+
+```{r main_plot}
+plot_claim_freq <- function(data, variable) {
+    df_grouped <- data %>%
+        mutate(bin = data[[variable]]) %>%
+        group_by(bin) %>% 
+        summarise(
+            sum_exp = sum(EXP),
+            sum_claims = sum(NCLAIMS),
+            lambda = sum_claims / sum_exp,
+            sd_lambda = sqrt(lambda / sum_exp),
+            lambda_95_lower = lambda - 1.96 * sd_lambda,
+            lambda_95_upper = lambda + 1.96 * sd_lambda,
+            lambda_99_lower = lambda - 2.58 * sd_lambda,
+            lambda_99_upper = lambda + 2.58 * sd_lambda
+        )
+    df_grouped$sum_no_claims <- df_grouped$sum_exp - df_grouped$sum_claims
+    df_counts <- bind_rows(
+        mutate(df_grouped, bin = bin, value = sum_claims, metric = "Claims"),
+        mutate(df_grouped, bin = bin, value = sum_no_claims, metric = "No Claims")
+    )
+    p_counts <- ggplot(df_counts, aes(x = bin, y = value, fill = metric)) +
+        geom_bar(stat = "identity") + theme_minimal() +
+        scale_fill_manual(values = c("Claims" = "firebrick", "No Claims" = "lightgray")) +
+        labs(x = variable, y = "Count", fill = "Metric") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        ggtitle("Exposure Split")
+    p_freq <- ggplot(df_grouped, aes(x = bin, group = 1)) +
+        geom_ribbon(
+            aes(ymin = lambda_99_lower, ymax = lambda_99_upper),
+            fill = "gray", alpha = 0.3
+        ) +
+        geom_ribbon(
+            aes(ymin = lambda_95_lower, ymax = lambda_95_upper),
+            fill = "lightblue", alpha = 0.5
+        ) +
+        geom_line(aes(y = lambda), color = "black") +
+        geom_point(aes(y = lambda), color = "black") +
+        geom_hline(yintercept = mean_claim_frequency, color = "red", linetype = "dashed") +
+        theme_minimal() +
+        labs(
+            x = variable,
+            y = "Claim Frequency (Lambda)",
+        ) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        ggtitle("Claim Frequency")
+    p_all <- p_freq / p_counts
+    p_all
+}
+```
+
+```{r test}
+plot_claim_freq(data, "BM_binned")
+```
+
+For this first example on the Bonus-Malus binned variable, we see a clear upward trend in the claim frequency as the Bonus-Malus level increases.
+This is expected as risky behaviour is translated in higher score on the BM scale. What is also interesting is that the claim frequency is a lot more precise for the 0 to 1 bin as the exposure is much higher compared to the higher BM levels.
+The confidence intervals also enable us to quickly test hypothesis that the claim frequency for a given bin is significantly different from the overall mean claim frequency (in red) or from other bins within the same variable[^hypTesting].
+
+[^hypTesting]: If the value is outside of the blue range, we can reject the hypothesis that the claim frequency for that bin is equal to the value with 95% certainty. For the grey interval, we can reject the hypothesis with 99% certainty.
+
+The same approach can be used for all variables:
+
+<br>
+
+#### Categorical Variables
+
+```{r test_all, result="asis"}
+for (cat_var in c("COVERAGE", "FUEL", "USE", "FLEET", "SEX")) {
+    cat(paste0("> ", cat_var, "\n"))
+    plot(plot_claim_freq(data, cat_var))
+}
+```
+
+Based on the graphs, here are the preliminary conclusions for univariate analysis of categorical variables:
+
+- `COVERAGE`
+
+The claim frequency between partial and full omnium is not statistically different. However both are different from third-party liability only. 
+It is interesting to see that the claim frequency is higher for these who choose lesser coverage. 
+This can be interpreted as a proxy for risk-awareness, financial education, or even purchasing power.
+Based on this exploration, we will merge the partial and full omnium to focus on the significant difference.
+
+```{r adapt_coverage}
+data$COVERAGE_BIN <- ifelse(data$COVERAGE == "TPL", "TPL", "OMN")
+data$COVERAGE_BIN <- as.factor(data$COVERAGE_BIN) %>% fct_infreq()
+plot_claim_freq(data, "COVERAGE_BIN")
+```
+
+- `FUEL`
+
+Diesel vehicles have significantly higher claim frequency compared to petrol vehicles. There is no obvious explanation for this statistical difference.
+
+- `USE`
+
+Private and professional use show no statistical differences from one another, nor from the mean. We will not include this variable in our models to avoid noise.
+Note that the proportion of policies related to work is very low, this has three consequences:
+
+1. The private use looks very similar to the average as it represents the majority of the policies.
+2. The work use is to variable to be statistically significant due to its low representation.
+3. The variable is too unbalanced to provide reliable insights for modeling purposes.
+
+- `FLEET`
+
+Let's compare the graph for fleet to the one of `USE`. Here again, we have a very unbalanced variable.
+
+1. The majority of policies are non-fleet, which makes the claim frequency for this category very similar to the overall average.
+2. Despite its low representation, the fleet category is significantly less risky than the non-fleet category.
+3. The variable has predictive potential despite the high volatility of the non-fleet category.
+
+- `SEX`
+
+Similarly to the interpretation for the `FLEET`, there is a significant difference in claim frequency even if one category is less represented than the other.
+In this case, the unbalance is less strong, the males are thus slightly further from the average and females are significantly more prone to claims than males.
+This variable also has predictive potential for modeling purposes.
+
+<br>
+
+#### Numerical Variables
+
+```{r test_all, result="asis"}
+for (cat_var in c("COVERAGE", "FUEL", "USE", "FLEET", "SEX")) {
+    cat(paste0("> ", cat_var, "\n"))
+    plot(plot_claim_freq(data, cat_var))
+}
+```
+
+
+### Statistical Approach
 
 ## Feature Engineering
 
