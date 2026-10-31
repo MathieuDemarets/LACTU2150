@@ -1119,13 +1119,169 @@ There are two main options for enriching our dataset with geographical informati
 
 **Code Hierarchy Enrichment**
 
-- We can take a shortcut by finding matching tables that link postcodes to regions, avoiding the geocoding and spatial matching steps.
+- We can take a shortcut by finding matching tables that link postcodes to refnis, and use the code to assign regions, avoiding the geocoding and spatial matching steps.
 - Then we merge these tables with our dataset based on the postcode to enrich it with the corresponding region.
 
-After this step, we can look for national statistics of population density/ road density in each postcode or region and merge them with our dataset to further enrich it.
+After this step, we can look for national statistics of population density for 1997 (year of the dataset) in each municipality and merge them with our dataset to further enrich it.
 
+```{r region-enrichment}
+conv <- read.csv("../data/postcode_refnis_conversion.csv", sep = ";") %>% data.frame()
+refnis <- read.csv("../data/refnis_matching.csv", sep = ";") %>% data.frame()
+pop <- read.csv("../data/pop_1997.csv", sep = ";") %>% data.frame() %>%
+    mutate(NIS.code = as.integer(NIS.code)) %>%
+    filter(!is.na(NIS.code) & NIS.code != "")
 
+dup_conv <- conv[duplicated(conv$Postal.code), ]
+if(nrow(dup_conv) > 0) {
+    warning("There are duplicate postal codes in the conversion table.")
+    conv %>% filter(Postal.code %in% dup_conv$Postal.code) %>% data.frame() %>%
+    kable(booktabs = TRUE, width = 100, caption = "Duplicate Postal Codes in Conversion Table")
+}
 
+dup_refnis <- refnis[duplicated(refnis$NIS_MUN), ]
+if(nrow(dup_refnis) > 0) {
+    warning("There are duplicate NIS_MUN codes in the refnis table.")
+    refnis %>% filter(NIS_MUN %in% dup_refnis$NIS_MUN) %>% data.frame() %>%
+    kable(booktabs = TRUE, width = 100, caption = "Duplicate NIS_MUN Codes in Refnis Table")
+}
+
+dup_pop <- pop[duplicated(pop$NIS.code), ]
+if(nrow(dup_pop) > 0) {
+    warning("There are duplicate NIS codes in the population table.")
+    pop %>% filter(NIS.code %in% dup_pop$NIS.code) %>% data.frame() %>%
+    kable(booktabs = TRUE, width = 100, caption = "Duplicate NIS Codes in Population Table")
+}
+```
+
+Before proceeding with the matching, we need to make sure that our matching keys are unique.
+We see that in the conversion table, there are duplicate postal codes, 1040 and 1050 can also be matched to Bruxelles but the other matched provide more insight (Etterbeek and Ixelles).
+For the postcode 1804, Vilvoorde is the corresponding municipality with some overlap with nearby Zemst which we will drop.
+
+```{r matched-data}
+
+conv_matching <- conv %>% filter(!(
+    (Postal.code == 1040 & Nom.commune == "Bruxelles") |
+    (Postal.code == 1050 & Nom.commune == "Bruxelles") |
+    (Postal.code == 1804 & Nom.commune == "Zemst")
+))
+if(any(duplicated(conv_matching$Postal.code))) {
+    stop("There are still duplicate postal codes in the filtered conversion table.")
+}
+
+matched <- data %>% select(c("ID", "PC")) %>%
+    mutate(PC = as.integer(as.character(PC))) %>%
+    left_join(select(conv_matching, c("Postal.code","Refnis.code")), by = c("PC" = "Postal.code")) %>%
+    left_join(select(refnis, c("NIS_MUN", "MUNICIPALITY", "REGION")), by = c("Refnis.code" = "NIS_MUN")) %>%
+    left_join(select(pop, c("NIS.code", "Totaal")), by = c("Refnis.code" = "NIS.code")) %>%
+    rename(
+        REFNIS = Refnis.code,
+        MUNICIPALITY = MUNICIPALITY,
+        REGION = REGION,
+        POPULATION = Totaal
+    )
+
+if(any(duplicated(matched$ID))) stop("There are duplicate IDs in the matched dataset.")
+if(nrow(matched) != nrow(data)) stop("The number of matched rows does not match the original data.")
+
+data_enriched <- data %>%
+    left_join(select(matched, c("ID", "REFNIS", "MUNICIPALITY", "REGION", "POPULATION")), by = "ID") 
+data_enriched <- data_enriched %>%
+    mutate(
+        REFNIS = factor(REFNIS) %>% fct_infreq(),
+        MUNICIPALITY = factor(MUNICIPALITY) %>% fct_infreq(),
+        REGION = factor(REGION) %>% fct_infreq(),
+        POPULATION = as.numeric(gsub("\\.", "", POPULATION))
+    )
+
+if(nrow(data) != nrow(data_enriched)) stop("The number of rows in the enriched data does not match the original data.")
+if(any(is.na(data_enriched$ID))) stop("There are missing IDs in the enriched data.")
+
+summary(data_enriched %>% select(c("PC", "REFNIS", "MUNICIPALITY", "REGION", "POPULATION"))) %>%
+kable(booktabs = TRUE, width = 100, caption = "Summary of Enriched Data")
+```
+
+Now that we have the enriched data, we can bin the population density into categories and assess the significance of municipality, region, and population density.
+Note that we have `r sum(is.na(data_enriched$POPULATION))` missing values in the population column. We'll create a bin for these missing values as well.
+
+```{r binning_population}
+baseline_pop <- qbinning(data_enriched, "POPULATION", "NCLAIMS", max_bins = 30)
+result_pop <- iv_elbow(data_enriched, "POPULATION", "NCLAIMS", baseline_pop)
+plot_iv_elbow(result_pop)
+```
+
+Based on the elbow plot, we can see the WoE and IV for 3, 7 and 30 bins:
+
+```{r woe_population}
+plots_pop <- list()
+for (i in c(3, 7, 30)) {
+    temp_bins_pop <- rebuild_bins(result_pop, i)
+    woe_temp_pop <- woe_calc(data_enriched, x = "POPULATION", y = "NCLAIMS", bins = temp_bins_pop)
+    plots_pop[[i]] <- plot_woe_iv(woe_temp_pop, interactive = FALSE)
+}
+(plots_pop[[3]] | plots_pop[[7]]) / (plots_pop[[30]])
+```
+
+We see a linear diminution of the WoE as the population increases, indicating that higher population areas tend to have higher claim frequencies as we expected.
+The linear trend seems well captured with 7 bins. We'll create the new binned variable with 7 levels.
+
+```{r binned_population}
+data_enriched$POPULATION_binned <- cut(
+    data_enriched$POPULATION,
+    breaks = rebuild_bins(result_pop, 7),
+    include.lowest = TRUE,
+    ordered_result = TRUE
+)
+data_enriched$POPULATION_binned <- addNA(data_enriched$POPULATION_binned)
+m0 <- glm(NCLAIMS ~ offset(log(EXP)), data = data_enriched, family = poisson(link = "log"))
+m1 <- glm(NCLAIMS ~ POPULATION_binned + offset(log(EXP)), data = data_enriched, family = poisson(link = "log"))
+chisq_result <- anova(m0, m1, test = "Chisq")
+sprintf("Is the effect of POPULATION_binned significant at 95%% confidence? %s", ifelse(chisq_result$`Pr(>Chi)`[2] < 0.05, "Yes", "No"))
+plot_claim_freq(data_enriched, "POPULATION_binned")
+```
+
+The variable is significant at 95% confidence, however we see that the 4 largest population bins have very similar claim frequencies, we can try merging them. Based on the confidence interval, we can also consider combining bin one and two. We would then get close to the 3 level binning we saw in the WoE and IV graphs above.
+
+```{r merged_population}
+initial_bins_merged <- data_enriched$POPULATION_binned
+
+last_bins_merged <- fct_collapse(
+    data_enriched$POPULATION_binned,
+    "(3.66e+04,4.53e+05]" = c("(3.66e+04,6.79e+04]", "(6.79e+04,1.05e+05]", "(1.05e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
+)
+
+three_bins_merged <- fct_collapse(
+    data_enriched$POPULATION_binned,
+    "Low Density" = c("[995,4.56e+03]", "(4.56e+03,8.75e+03]"),
+    "Medium Density" = c("(8.75e+03,3.66e+04]"),
+    "High Density" = c("(3.66e+04,6.79e+04]", "(6.79e+04,1.05e+05]", "(1.05e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
+)
+
+m2 <- glm(NCLAIMS ~ offset(log(EXP)) + initial_bins_merged, data = data_enriched, family = poisson(link = "log"))
+m1 <- glm(NCLAIMS ~ offset(log(EXP)) + last_bins_merged, data = data_enriched, family = poisson(link = "log"))
+m0 <- glm(NCLAIMS ~ offset(log(EXP)) + three_bins_merged, data = data_enriched, family = poisson(link = "log"))
+anova(m0, m1, m2, test = "Chisq")
+```
+
+Based on the result of the anova test, it seems that merging the bins into three levels does not significantly increase the marginal deviance. We'll therefore adopt the three-level binning for the population variable which is a lot easier to interpret and work with.
+
+```{r three_bins_plot}
+data_enriched$POPULATION_binned <- three_bins_merged
+plot_claim_freq(data_enriched, "POPULATION_binned")
+```
+
+It is interesting to note that the `NA` bin looks similar to medium density with slightly more variability.
+
+Finally, we will check the significance of our `MUNICIPALITY` and `REGION` variables. We will also drop the `PC` variable which is harder to interpret than municipality names.
+
+```{r municipality_region_significance}
+m0 <- glm(NCLAIMS ~ offset(log(EXP)), data = data_enriched, family = poisson(link = "log"))
+for (var in c("MUNICIPALITY", "REGION")) {
+    formula <- as.formula(paste("NCLAIMS ~ offset(log(EXP)) +", var))
+    m <- glm(formula, data = data_enriched, family = poisson(link = "log"))
+    test_result <- anova(m0, m, test = "Chisq")
+    cat(sprintf("Is variable %s significant? %s\n", var, ifelse(test_result$`Pr(>Chi)`[2] < test_level, "Yes", "No")))
+}
+```
 
 
 [^projection]: Coordinate Reference System are identifiers to explain how the projection from a 3D sphere to a 2D plane is performed. The Belgian Lambert 2008 (3812) projection is commonly used for visualizing geographical data in Belgium.
