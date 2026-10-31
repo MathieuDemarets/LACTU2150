@@ -1203,6 +1203,8 @@ kable(booktabs = TRUE, width = 100, caption = "Summary of Enriched Data")
 Now that we have the enriched data, we can bin the population density into categories and assess the significance of municipality, region, and population density.
 Note that we have `r sum(is.na(data_enriched$POPULATION))` missing values in the population column. We'll create a bin for these missing values as well.
 
+#### Population Density
+
 ```{r binning_population}
 baseline_pop <- qbinning(data_enriched, "POPULATION", "NCLAIMS", max_bins = 30)
 result_pop <- iv_elbow(data_enriched, "POPULATION", "NCLAIMS", baseline_pop)
@@ -1271,18 +1273,127 @@ plot_claim_freq(data_enriched, "POPULATION_binned")
 
 It is interesting to note that the `NA` bin looks similar to medium density with slightly more variability.
 
-Finally, we will check the significance of our `MUNICIPALITY` and `REGION` variables. We will also drop the `PC` variable which is harder to interpret than municipality names.
+#### Regions
+
+We will check the significance and claim frequency across regions
 
 ```{r municipality_region_significance}
 m0 <- glm(NCLAIMS ~ offset(log(EXP)), data = data_enriched, family = poisson(link = "log"))
-for (var in c("MUNICIPALITY", "REGION")) {
-    formula <- as.formula(paste("NCLAIMS ~ offset(log(EXP)) +", var))
-    m <- glm(formula, data = data_enriched, family = poisson(link = "log"))
-    test_result <- anova(m0, m, test = "Chisq")
-    cat(sprintf("Is variable %s significant? %s\n", var, ifelse(test_result$`Pr(>Chi)`[2] < test_level, "Yes", "No")))
-}
+m1 <- glm(NCLAIMS ~ offset(log(EXP)) + REGION, data = data_enriched, family = poisson(link = "log"))
+    test_result <- anova(m0, m1, test = "Chisq")
+    cat(sprintf("Is variable %s significant? %s\n", "REGION", ifelse(test_result$`Pr(>Chi)`[2] < test_level, "Yes", "No")))
+plot_claim_freq(data_enriched, "REGION")
 ```
 
+It is clear that the Brussels region has a distinct claim frequency pattern compared to the other regions. We'll test if it makes sense to keep the Walloon and Flemish regions separate as well or not.
+
+```{r region_significance}
+merged_regions <- fct_collapse(
+    data_enriched$REGION,
+    "Brussels" = c("RÉGION DE BRUXELLES-CAPITALE"),
+    "Others" = c("RÉGION WALLONNE", "RÉGION FLAMANDE"),
+)
+data_enriched$REGION_merged <- merged_regions
+m0 <- glm(NCLAIMS ~ offset(log(EXP)) + REGION, data = data_enriched, family = poisson(link = "log"))
+m1 <- glm(NCLAIMS ~ offset(log(EXP)) + REGION_merged, data = data_enriched, family = poisson(link = "log"))
+test_result <- anova(m0, m1, test = "Chisq")
+sprintf("Was it justified to merge the REGION bins? %s", ifelse(test_result$`Pr(>Chi)`[2] < test_level, "No", "Yes"))
+plot_claim_freq(data_enriched, "REGION_merged")
+```
+
+We see that despite a much lower exposure in Brussels, the claim frequency is significantly higher from the other regions.
+This confirms our hypothesis that urban areas, such as Brussels, tend to have a higher claim frequency compared to less densely populated regions.
+We can quickly check our second hypothesis that despite higher frequencies, the severity is lower in urban areas like Brussels.
+
+```{r severity_by_region}
+urb_rur_comp <- data_enriched %>%
+    group_by(REGION_merged) %>%
+    summarise(
+        total_claims = sum(NCLAIMS),
+        total_exposure = sum(EXP),
+        total_claims = sum(NCLAIMS),
+        total_claim_amount = sum(AMOUNT),
+        frequency = total_claims / total_exposure,
+        severity = total_claim_amount / total_claims,
+        expected_claims = frequency * severity
+    ) %>%
+    arrange(desc(frequency)) 
+urb_rur_comp %>%
+    kable(
+        caption = "Expected claims by merged region\nSplit by frequency and severity",
+        align = "l", booktabs = TRUE
+    )
+```
+
+With this quick descriptive analysis, we can confirm that in our sample:
+
+- The claim frequency is higher in urban areas like Brussels compared to other regions (factor `r urb_rur_comp$frequency[urb_rur_comp$REGION_merged == "Brussels"]/urb_rur_comp$frequency[urb_rur_comp$REGION_merged == "Others"]`)
+- The claim severity is lower in urban areas like Brussels compared to other regions (factor `r urb_rur_comp$severity[urb_rur_comp$REGION_merged == "Brussels"]/urb_rur_comp$severity[urb_rur_comp$REGION_merged == "Others"]`)
+- The frequency effect outweighs the severity effect in determining the expected claims between urban and other regions (factor `r urb_rur_comp$expected_claims[urb_rur_comp$REGION_merged == "Brussels"]/urb_rur_comp$expected_claims[urb_rur_comp$REGION_merged == "Others"]`)
+
+We expect to see similar effects for other granularities, such as municipalities, where urban areas may exhibit higher claim frequencies but lower severities compared to less densely populated areas.
+
+#### Municipalities
+
+There are far too many municipalities to use it as a simple categorical variable in our models. We can thus focus on the n largest municipalities by exposure and group the remaining ones into an "Other" category.
+
+```{r municipalities_aggregation}
+data_enriched %>%
+    group_by(MUNICIPALITY) %>%
+    summarise(
+        total_exposure = sum(EXP)
+    ) %>%
+    arrange(desc(total_exposure)) %>% head(n=50) %>%
+    ggplot(aes(x = reorder(MUNICIPALITY, -total_exposure), y = total_exposure)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Municipality", y = "Total Exposure") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+We can focus on the 6 largest municipalities by exposure before the exposure distribution flattens out.
+
+```{r top_municipalities}
+exp_breakpoint <- data_enriched %>%
+    group_by(MUNICIPALITY) %>%
+    summarise(
+        total_exposure = sum(EXP)
+    ) %>%
+    arrange(desc(total_exposure)) %>%
+    head(n=6) 
+data_enriched$MUNICIPALITY_binned <- ifelse(data_enriched$MUNICIPALITY %in% exp_breakpoint$MUNICIPALITY, as.character(data_enriched$MUNICIPALITY), "Other")
+data_enriched$MUNICIPALITY_binned <- factor(data_enriched$MUNICIPALITY_binned) %>% fct_infreq()
+
+plot_claim_freq(data_enriched, "MUNICIPALITY_binned")
+m0 <- glm(NCLAIMS ~ offset(log(EXP)), data = data_enriched, family = poisson(link = "log"))
+m1 <- glm(NCLAIMS ~ MUNICIPALITY_binned + offset(log(EXP)), data = data_enriched, family = poisson(link = "log"))
+results <- anova(m0, m1, test = "Chisq")
+cat(sprintf("Is variable %s significant? %s\n", "MUNICIPALITY_binned", ifelse(results$`Pr(>Chi)`[2] < test_level, "Yes", "No")))
+```
+
+We now have a binned version of the MUNICIPALITY variable which is significant and usable in our model. Of course, the exposure is limited even in the bigger municipalities and that causes some variability in the frequency estimates.
+However, for the sake of interpretation, we'll keep the cities separated even though Charleroi and Antwerp are similar in terms of frequency and so are Gand and Liège.
+We seem to capture a similar phenomenon with cities having a higher claim frequency compared to smaller municipalities even if the effect is less clear than for the regions.
+
+```{r desc_top_municipalities}
+data_enriched %>%
+    group_by(MUNICIPALITY_binned) %>%
+    summarise(
+        total_claims = sum(NCLAIMS),
+        total_exposure = sum(EXP),
+        total_claim_amount = sum(AMOUNT),
+        frequency = total_claims / total_exposure,
+        severity = total_claim_amount / total_claims,
+        expected_claims = frequency * severity
+    ) %>%
+    arrange(desc(frequency)) %>%
+    kable(
+        caption = "Expected claims by municipality\nSplit by frequency and severity",,
+        align = "l", booktabs = TRUE
+    )
+```
+
+Even if some cities follow the high frequency, low severity pattern, we do find outliers such as Charleroi where the severity is unusually high or Liège where it falls unusually low.
+We then seem to capture something more than the simple urban-rural divide which justifies keeping the `MUNICIPALITY_binned` variable in our model.
 
 [^projection]: Coordinate Reference System are identifiers to explain how the projection from a 3D sphere to a 2D plane is performed. The Belgian Lambert 2008 (3812) projection is commonly used for visualizing geographical data in Belgium.
 
