@@ -1044,7 +1044,91 @@ We will come back to them in the feature engineering section.
 
 ## Feature Engineering
 
+Besides the existing features, we can create additional features to add information to our design matrix and potentially improve our models.
+
+- **Geospatial Features**:
+We will first explore the existing `PC` and `TOWN` variables`. Note that these are simply categorical representations of the longitude and latitude for different granularities of location.
+We will then explore different granularities and use the spatial information to enrich our feature set.
+
+- **Polynomial Features**:
+As we will see in the modelling section, adding polynomial features can be a good way to capture non-linear relationships in our GLM models.
+This is an intermediate step towards the smoothing functions of Generalized Additive Models (GAMs).
+We can test the second and third degree polynomial features for continuous variables and bin the statistically significant features to create new categorical variables for our GLM.
+Note that this is less straighforward to explain to a customer. It is best used in technical premium modeling but should likely be removed from the commercial premium models.
+
+- **Interaction Features**:
+All the analysis we have done so far has focused on individual features. The statistical modelling (GLM, GAM) will allow us to capture the controlled effects of the features.
+However, some interactions between features are not captured by linear terms alone. We can create interaction features to explicitly model these effects.
+
 ### Geospatial Features
+
+Location can be considered at multiple levels of granularity. In Belgium, the `National Institute of Statistics` provides a `NIS code` nomenclature that uniquely identifies each location at various granularities, from most specific to most general:
+
+- `Statistical Sector`:(~20,000 sectors) that are granular enough to capture neighborhood variations within a postal code. This is typically interesting for sociodemographic (socioeconomic indexes, population density, etc.) analysis.
+- `Postal Code (PC)`:(~600 codes) a more aggregated level, capturing aggregated characteristics. This is a more practical level for many analyses to avoid missing data issues and respecting privacy concerns on limited datasets.
+- `Administrative Arrondissement`:(~40 arrondissements) this might be the less informative level for us as it is very aggregated but is not a political division yet.
+- `Province`:(~10 provinces) the political implications should be considered at this level as provinces have a certain degree of autonomy. Note that Brussels-Capital does not have this level of granularity as it is a region.
+- `Region`:(3 regions) the highest level of granularity, the biggest political and administrative decision-making occurs at this level. It captures a different kind of information compared to the more localized levels.
+
+Choosing the best level of analysis is not an easy task. It first depends on data availability and portfolio size.
+For smaller portfolios or when data is sparse, higher-level aggregations like provinces will allow for more robust statistical analysis.
+Conversely, for larger portfolios with sufficient data, more granular levels like statistical sectors or postal codes will help better differentiate risk pockets.
+
+Besides, granularities will often capture completly different underlying risk. Let's clarify this with a climate risk example [^climate-risk] using different granularities.
+
+- `Latitude` and `Longitude`: 
+These **numerical** features simple indicate the point on a map. If we have a large enough geographical coverage, it will help us capture meteorological patterns.
+For **physical risks**, such as floods or storms, we understand that a northern country will face different risk (hail breaking the windhshield, floods damaging the cars parked outdoors) compared to a southern country where heatwaves can cause damage to tires and paintwork.
+In a single country such as Belgium, it won't be very helpful as such but might capture other factors such as traffic density, urbanization, or quality of infrastructure.
+The `Statistical Sector` or `Postal Code` can also act as proxies for these underlying factors.
+
+- `Regions`:
+The **categorical** features will capture administrative and political divisions, which can be important for understanding regional policies and regulations.
+When we look at **transition risk**, this becomes particularly relevant. For example, when the Brussels-Capital Region restricted the access to old diesel vehicles, this became stranded assets for owners of such vehicles within the region.
+Regions can take other decisions that impact risk exposure, such as subsidising electric vehicles, promoting public transportation, or offering advantageous schemes for company cars. This will play a role in the behavioral patterns and risk exposure of vehicle owners within the region.
+
+We should not "choose" between granularities as they capture different underlying information. 
+However, **multicollinearity** is a clear risk when working with various granularities of a same feature which can lead to unstable model with hard-to-interpret individual feature effects.
+In our dataset, we already have the postcode (`r length(unique(data$PC))` levels) and town (`r length(unique(data$TOWN))` levels) which seem to capture the same underlying geographical information and the `LAT` and `LONG` features.
+
+To avoid redundancy, we will drop the `TOWN` feature and keep the `PC` which is part of the official NIS nomenclature.
+`LAT` and `LONG` will also be kept as numerical input for the smoothing functions we will use in the GAM models.
+To capture political and administrative underlying factors, we will add the `Regions` feature as a categorical variable.
+Finally, we will fetch the demographic density for each postcode which will serve as a proxy for urbanization and traffic exposure. 
+We expect higher frequency of claims and lower severity in areas with higher demographic density, as traffic congestion may lead to more minor accidents rather than severe ones.
+Conversely, we expect lower frequency and higher severity in more rural areas.
+It will be interesting to control the predictive power of postcode with demographic density to see if it has predictive power beyond what is captured by urbanization and traffic exposure.
+
+[^climate-risk]: This is not in the scope of our analysis but it is an important topic worth a small introduction nowadays.
+
+#### Dataset Enrichment
+
+Before the enrichment, let us drop the `TOWN` feature as it is redundant but not perfecly aligned with the postcode, we'll replace it with postcode labels.
+
+```{r drop-town-feature}
+data <- data %>% select(-TOWN)
+```
+
+There are two main options for enriching our dataset with geographical information:
+
+**Geospatial Enrichment**
+
+- Geocode the `LAT` and `LONG` features to obtain precise geographical coordinates. We will use the Belgian Lambert 2008 (3812) projection[^projection] to be in line with the NIS standards.
+- Download the [shapefiles for Belgian administrative boundaries](https://statbel.fgov.be/en/open-data/statistical-sectors-2025).
+- Perform spatial matching between the geocoded points and the administrative boundaries to enrich the dataset with region, postcode, and statistical sector information.
+
+**Code Hierarchy Enrichment**
+
+- We can take a shortcut by finding matching tables that link postcodes to regions, avoiding the geocoding and spatial matching steps.
+- Then we merge these tables with our dataset based on the postcode to enrich it with the corresponding region.
+
+After this step, we can look for national statistics of population density/ road density in each postcode or region and merge them with our dataset to further enrich it.
+
+
+
+
+
+[^projection]: Coordinate Reference System are identifiers to explain how the projection from a 3D sphere to a 2D plane is performed. The Belgian Lambert 2008 (3812) projection is commonly used for visualizing geographical data in Belgium.
 
 ### Polynomial Features
 
