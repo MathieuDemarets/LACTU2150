@@ -41,6 +41,9 @@ if (!require("ggplot2")) install.packages("ggplot2")
 if (!require("plotly")) install.packages("plotly")
 if (!require("patchwork")) install.packages("patchwork")
 if (!require("pheatmap")) install.packages("pheatmap")
+if (!require("rpart")) install.packages("rpart")
+if (!require("rpart.plot")) install.packages("rpart.plot")
+if (!require("caret")) install.packages("caret")
 
 library(dplyr)
 library(forcats)
@@ -50,6 +53,10 @@ library(ggplot2)
 library(plotly)
 library(patchwork)
 library(pheatmap)
+library(rpart)
+library(rpart.plot)
+library(caret)
+
 ```
 
 # Executive Summary
@@ -59,8 +66,9 @@ library(pheatmap)
 ## Overview of the Dataset
 
 The first step of the data exploration process is to load the insurance claims of our Belgian Motor Third Party Liability (MTPL) dataset.
-We will start ensuring the uniqueness of keys. Then, we'll have a look at our target variables and the distribution of the exposure.
-Finally, we will have a quick look at the predictor variables we have before diving in the data transformation and exploration.
+We will start ensuring the uniqueness of keys. Straight after that, we will split the data between training and testing sets to make sure we keep a proper holdout for model evaluation.
+Then, we'll have a look at our target variables and the distribution of the exposure.
+Finally, we will have a quick look at the predictor variables we have before diving in the data transformation, exploration, and feature engineering.
 
 <br>
 
@@ -75,12 +83,20 @@ setwd(paste0(
 load("../data/mtpl_be.rda")
 data <- mtpl_be
 
-n_unique_ids <- length(unique(data$ID))
-n_rows <- nrow(data)
+n_unique_ids <- length(unique(mtpl_be$ID))
+n_rows <- nrow(mtpl_be)
 cat(sprintf(
     "Number of unique IDs: %d\nNumber of rows: %d\nAre they equal? %s", 
     n_unique_ids, n_rows, 
     ifelse(n_unique_ids == n_rows, "Yes", "No")
+))
+
+index_training <- createDataPartition(mtpl_be$NCLAIMS, times = 1, p = 0.8, list = FALSE) # Note that we make a single partition, cv will be done with the training set during modelling
+data <- mtpl_be[index_training, ]
+holdout <- mtpl_be[-index_training, ]
+cat(sprintf(
+    "Training set rows (data): %d\nTesting set rows (holdout): %d\n",
+    nrow(data), nrow(holdout)
 ))
 ```
 
@@ -184,7 +200,7 @@ Regarding the exposure, we see that a large majority of the policies have an exp
 About `r 1-round(sum(data$EXP == 1) / nrow(data), 2)` of the policies have an exposure less than 1. This does not suggest that an analysis per exposure level is necessary.
 
 Exposure should still be considered to correctly estimate the claim frequency as counting full exposure would underestimate the risk.
-The correct way to compute the mean claim frequency is $$\frac{\sum{NCLAIMS}}{\sum{EXP}}, \text{ where } EXP \in [0, 1]$$ will therefore be hugher than the naive mean $$\frac{\sum{NCLAIMS}}{nrow(data) = \sum{1}}$$
+The correct way to compute the mean claim frequency is $$\frac{\sum{NCLAIMS}}{\sum{EXP}}, \text{ where } EXP \in [0, 1]$$ which will therefore be higher than the simple mean $$\frac{\sum{NCLAIMS}}{nrow(data) = \sum{1}}$$
 ```{r mean_frequency}
 mean_claim_frequency <- sum(data$NCLAIMS) / sum(data$EXP)
 se_mean <- sqrt(mean_claim_frequency / sum(data$EXP))
@@ -290,7 +306,12 @@ assert_ref_level(data,  c("COVERAGE", "FUEL", "USE", "FLEET", "SEX", "TOWN", "PC
 
 ### Numerical Variables Binning
 
-For the initial `GLM` modeling, we will need to discretize the continuous numerical variables into bins. We will use the same binning strategy for discrete variables to reduce the amount of bins and simplify the model interpretation.
+For the initial `GLM` modeling, the numerical variables can be used but this assumes that:
+
+- The effect of one increment of the numerical variable on the target is assumed to be linear (age 18 to 19 has the same effect as age 50 to 51 which may not be realistic as experience marginal returns are likely diminishing).
+- The linearity assumption may not hold for all numerical variables, and discretizing them into bins can help capture non-linear relationships with the target.
+
+For these reasons, we will discretize the continuous numerical variables into bins. 
 Defining optimal binning for a numerical variable is a complex and important step. There are a set of naive approaches that can be used:
 
 - Singleton bins: Each unique value of the numerical variable is treated as a separate bin.
@@ -298,7 +319,7 @@ Defining optimal binning for a numerical variable is a complex and important ste
 - Equal-frequency bins: Quantiles of the variable are used to create bins with approximately the same number of observations.
 
 For this project, we will try to implement a more complex approach based on weight of evidence (WoE) to automatically determine a suitable binning for numerical variables. 
-The idea of WoE binning is to group values based on how strongly they are associated with the target variable (binary outcome encoded as 0 if claim = 0 and 1 if claim >= 1):
+The idea of WoE binning is to group values based on how strongly they are associated with the target variable (binary outcome encoded as good if claim = 0 and bad if claim >= 1):
 
 $$
 \text{WoE} = \ln \frac{\text{proportion of Good Outcomes in the bin}}{\text{proportion of Bad Outcomes in the bin}}
@@ -374,7 +395,7 @@ theme(axis.text.x = element_text(angle = 60, hjust = 1))
 ggplotly(p)
 ```
 
-Starting with 30 quantile bins, we apply our tweaked function `qbinning` to the `AGEPH` variable and find these `r length(bins_ageph) - 1` bins with somepolicies having at least one claim.
+Starting with 30 quantile bins, we apply our tweaked function `qbinning` to the `AGEPH` variable and find these `r length(bins_ageph) - 1` bins with some policies having at least one claim.
 
 #### Weight of Evidence (WoE) and Information Value (IV) Calculation
 
@@ -386,10 +407,7 @@ Based on the formula presented above, the weight of evidence (WoE) for each bin 
 If the bin has as much good (no claim) as bad (at least one claim) outcomes, the WoE will be zero as there is very little predictive power in that bin.
 If the bin has more good outcomes than bad outcomes, the WoE will be positive, indicating that the bin is associated with a lower risk. 
 Finally, if the bin has more bad outcomes than good outcomes, the WoE will be negative, indicating that the bin is associated with a higher risk.
-
-The Information Value (IV) is a measure based on the Weight of Evidence (WoE) that quantifies the predictive power of a feature in distinguishing between good and bad outcomes. It is calculated as:
-
-$$\text{IV} = \sum_{\text{bins}} (\text{proportion of Good Outcomes in the bin} - \text{proportion of Bad Outcomes in the bin}) \times \text{WoE of the bin}$$
+The IV quantifies the overall predictive power based on the differences in the distribution of good and bad outcomes and the corresponding WoE values.
 
 ```{r woe_calculation}
 woe_calc <- function(data, x, y, bins) {
@@ -468,7 +486,7 @@ The example for `AGEPH` already shows very interesting patterns for our baseline
 - The WoE values go from negative to positive, indicating that the younger age groups have a higher likelihood of bad outcomes (at least one claim) compared to the older age groups.
 - The IV line shows a very high contribution from the young and older age groups, indicating that these bins are the most predictive for the likelihood of claims.
 
-Let's confirm the relationship between age and number of claims by examining correlation between `AGEPH` and `NCLAIMS` and visualizing it.
+Let's confirm visuallythe relationship between age and number of claims by examining the boxplots and claim frequency by age bin.
 
 ```{r age_claims_correlation}
 # boxplot of age for each number of claims
@@ -621,7 +639,6 @@ Based on the comparison above, the optimal amount of bins seems to be 7 because:
 - We capture in fine granularity the effet of young ages with higher risk.
 - We skip the middle of the age distribution which brings no additional information (28 to 66).
 - We capture the effect of older ages with lower risk profiles with good granularity.
-- We see that last effect fading slightly for the oldest ages (above 71)
 
 The complex pattern we noticed in our initial `r length(bins_ageph) - 1` bins seems to be well captured with 7 bins only.
 
@@ -659,7 +676,7 @@ for (i in c(3, 4, 5, 11)) {
 ```
 
 We see that most information is captured by the first bin indicating that those with a BM of 0 are significantly safer than the others.
-The three bins are sufficient to capture the separate the first and second risk groups that are the first and second half of the BM score.
+The three bins are sufficient to capture the first group at bonus-malus zero, then the first and second risk groups that are the first and second half of the BM score.
 Adding bins just creates bins in between with low informational value.
 
 ```{r adding_binned_bm}
@@ -676,16 +693,16 @@ result_agec <- iv_elbow(data, "AGEC", "NCLAIMS", baseline_agec)
 plot_iv_elbow(result_agec, interactive = TRUE)
 ```
 
-For the age of the car (`AGEC`), we see a plateau after around 5 bins, let's compare 3, 4, 5, and 16 (max) bins.
+For the age of the car (`AGEC`), we also see a plateau after around 5 and 9 bins, let's compare 3, 5, 9 and 16 (max) bins.
 
 ```{r rebuild_bins_agec}
 plots_agec <- list()
-for (i in c(3, 4, 5, 16)) {
+for (i in c(3, 5, 9, 16)) {
     temp_bins_agec <- rebuild_bins(result_agec, i)
     woe_temp_agec <- woe_calc(data, x = "AGEC", y = "NCLAIMS", bins = temp_bins_agec)
     plots_agec[[i]] <- plot_woe_iv(woe_temp_agec, interactive = FALSE)
 }
-(plots_agec[[3]] | plots_agec[[4]]) / (plots_agec[[5]] | plots_agec[[16]])
+(plots_agec[[3]] | plots_agec[[5]]) / (plots_agec[[9]] | plots_agec[[16]])
 
 ```
 
@@ -712,16 +729,16 @@ result_power <- iv_elbow(data, "POWER", "NCLAIMS", baseline_power)
 plot_iv_elbow(result_power, interactive = TRUE)
 ```
 
-For the power of the car (`POWER`), we have stairs at 5, 7, and 12 bins. We'll compare these three steps with the max level of bins (23).
+For the power of the car (`POWER`), we have stairs at 6, 8, and 13 bins. We'll compare these three steps with the max level of bins (23).
 
 ```{r rebuild_bins_power}
 plots_power <- list()
-for (i in c(5, 7, 12, 23)) {
+for (i in c(6, 8, 13, 23)) {
     temp_bins_power <- rebuild_bins(result_power, i)
     woe_temp_power <- woe_calc(data, x = "POWER", y = "NCLAIMS", bins = temp_bins_power)
     plots_power[[i]] <- plot_woe_iv(woe_temp_power, interactive = FALSE)
 }
-(plots_power[[5]] | plots_power[[7]]) / (plots_power[[12]] | plots_power[[23]])
+(plots_power[[6]] | plots_power[[8]]) / (plots_power[[13]] | plots_power[[23]])
 
 ```
 
@@ -731,15 +748,15 @@ We notice two informative risk pockets (bins=12). A quick web search indicates t
 - Power between 44 and 47: this is the minimum legal and practical power for modern highway-legal cars. Below this range, cars are typically underpowered for regular driving conditions.
 - Power between 50 and 51: this is widely considered the mechanical sweet spot to maintain highway speed withouf sacrificing fuel economy in urban driving. It is typically a marker of entry-level city cars.
 
-Based on this interpretation, the power could be a proxy for the type of car and its urban usage. We will use 7 bins to account for the identification of entry-level city cars without overcomplicating the model with too many bins.
+Based on this interpretation, the power could be a proxy for the type of car and its urban usage. We will use 8 bins to capture this bump risk pattern without overcomplicating the model.
 
 [^disclaimer]: The interpretations are the result of google IA's search and should be taken with caution. A true market research and assessment of the hidden factors is outside the scope of this assignment.
 
 ```{r adding_binned_power}
 data$POWER_binned <- cut(
-    data$POWER,
-    breaks = rebuild_bins(result_power, 7)
-    , include.lowest = TRUE, ordered_result = TRUE)
+    data$POWER,   
+    breaks = rebuild_bins(result_power, 8),
+    include.lowest = TRUE, ordered_result = TRUE)
 ```
 
 We will end this Data Transformation section here now that we have bins for both categorical and numerical variables.
@@ -810,7 +827,7 @@ plot_claim_freq <- function(data, variable) {
 }
 ```
 
-```{r test}
+```{r test_bm_plot}
 plot_claim_freq(data, "BM_binned")
 ```
 
@@ -897,15 +914,15 @@ We will come back to this in the statistical approach section and see with an an
 - `AGEC_binned`
 
 For the age of the car, we can confirm our previous observations that brand new cars (0-1 years old) have more claims.
-We can also confir the lower risk for cars between 1 and 3 years old and above 15 years.
+We can also confirm the lower risk for cars between 1 and 3 years old and above 15 years.
 The remaining question is whether the bins 1 to 2 and 2 to 3 should be merged in a single bin.
 We will revisit this question in the statistical approach section to determine if merging these bins significantly affects the model performance.
 
 - `POWER_binned`
 
 Thanks to our binning algorithm, we correctly identified the low-risk for power lower than 33 kilowatts.
-We also correctly identified the very localised peak in risk for power 50 to 51 kilowatts.
-It is not clear whether the last 3 to 4 bins should be merged or kept separate, as the risk pattern is less pronounced in this range. We will also investigate this in the statistical approach section.
+We also correctly identified the very bump-shaped peak in risk for power 44 to 51 kilowatts.
+It is not clear whether the last 3 bins should be merged or kept separate, as the risk pattern is less pronounced in this range. We will also investigate this in the statistical approach section.
 
 ### Statistical Approach
 
@@ -916,17 +933,17 @@ In this statistical data exploration, we will add two anova layers onto that vis
 
 We will compare the deviance of the model with the variable as single predictor to the null model with only the offset term. This will allow us to test if the variable significantly improves the model fit:
 
-$H_0: \var D = D_0 - D_1 = 0$
-$H_1: \var D = D_0 - D_1 > 0$
+$H_0: \Delta D = D_0 - D_1 = 0$
+$H_1: \Delta D = D_0 - D_1 > 0$
 
-For our test statistic we have $ \var D \sim \chi^2_{df} $, where $df$ is the difference in the number of parameters between the null and alternative models.
+For our test statistic we have $\Delta D \sim \chi^2_{df}$, where $df$ is the difference in the number of parameters between the null and alternative models.
 
 Our $D_0$ represents the deviance of the null model with only the offset term: `glm(NCLAIMS ~ offset(log(EXP)))`.
 The $D_1$ represents the deviance of the model with the variable as a single predictor: `glm(NCLAIMS ~ offset(log(EXP)) + get(var))`.
 
 ```{r null_model}
 m0 <- glm(NCLAIMS ~ offset(log(EXP)), data = data, family = poisson(link = "log"))
-sprintf("Because we use Poisson with its canonic link, note exp(Beta0) = %f is equal to the empiric claim frequency = %f", exp(coef(m0)[1]), sum(data$NCLAIMS)/sum(data$EXP))
+cat(sprintf("Because we use Poisson with its canonic link, note exp(Beta0) = %f is equal to the empiric claim frequency = %f", exp(coef(m0)[1]), sum(data$NCLAIMS)/sum(data$EXP)))
 ```
 
 Let's now compare this null model to the models with each predictor variable individually.
@@ -952,8 +969,8 @@ m0 <- glm(NCLAIMS ~ offset(log(EXP)) + COVERAGE_BIN, data = data, family = poiss
 m1 <- glm(NCLAIMS ~ offset(log(EXP)) + COVERAGE, data = data, family = poisson(link = "log"))
 test_result <- anova(m0, m1, test = "Chisq")
 pval <- test_result$`Pr(>Chi)`[2]
-sprintf("Was it justified to merge the COVERAGE bins? %s", ifelse(pval < 0.05, "No", "Yes"))
-sprintf("Are you 99%% sure that it was not justified? %s", ifelse(pval < 0.01, "Yes", "No"))
+cat(sprintf("Was it justified to merge the COVERAGE bins? %s", ifelse(pval < 0.05, "No", "Yes")))
+cat(sprintf("Are you 99%% sure that it was not justified? %s", ifelse(pval < 0.01, "Yes", "No")))
 ```
 
 Because the p-value is `r pval`, we can conclude that we reject the hypothesis that the deviance was different between the merged and unmerged COVERAGE bins at a 95% confidence level but not at a 99% confidence level.
@@ -976,6 +993,7 @@ pval <- test_result$`Pr(>Chi)`[2]
 
 if(pval < 0.05) {
     cat(sprintf("Merging the last 3 bins of AGEPH_binned was not justified (p-value = %f).\n", pval))
+    data$AGEPH_binned_merged <- NULL
 } else {
     cat(sprintf("Merging the last 3 bins of AGEPH_binned was justified (p-value = %f).\n", pval))
     plot(plot_claim_freq(data, "AGEPH_binned_merged"))
@@ -997,45 +1015,30 @@ pval <- test_result$`Pr(>Chi)`[2]
 
 if(pval < 0.05) {
     cat(sprintf("Merging the second and third bins of AGEC_binned was not justified (p-value = %f).\n", pval))
+    data$AGEC_binned_merged <- NULL
 } else {
     cat(sprintf("Merging the second and third bins of AGEC_binned was justified (p-value = %f).\n", pval))
     plot(plot_claim_freq(data, "AGEC_binned_merged"))
 }
 ```
 
-- The last 3 or last four bins of `POWER_binned`
+- The last 3 bins of `POWER_binned`
 
 ```{r merge_power}
 data$POWER_binned_merged <- fct_collapse(
     data$POWER_binned, 
-    "(51,243]" = c("(51,66]", "(66,83]", "(83,99]", "(99,243]")
+    "(66,243]" = c("(66,83]", "(83,99]", "(99,243]")
 )
-
 m0 <- glm(NCLAIMS ~ offset(log(EXP)) + POWER_binned, data = data, family = poisson(link = "log"))
 m1 <- glm(NCLAIMS ~ offset(log(EXP)) + POWER_binned_merged, data = data, family = poisson(link = "log"))
 test_result <- anova(m0, m1, test = "Chisq")
 pval <- test_result$`Pr(>Chi)`[2]
 
 if(pval < 0.05) {
-    cat(sprintf("Merging the last 4 bins of POWER_binned was not justified (p-value = %f).\n", pval))
-    data$POWER_binned_merged <- fct_collapse(
-        data$POWER_binned, 
-        "(66,243]" = c("(66,83]", "(83,99]", "(99,243]")
-    )
-
-    m0 <- glm(NCLAIMS ~ offset(log(EXP)) + POWER_binned, data = data, family = poisson(link = "log"))
-    m1 <- glm(NCLAIMS ~ offset(log(EXP)) + POWER_binned_merged, data = data, family = poisson(link = "log"))
-    test_result <- anova(m0, m1, test = "Chisq")
-    pval <- test_result$`Pr(>Chi)`[2]
-
-    if(pval < 0.05) {
-        cat(sprintf("And merging the last 3 bins of POWER_binned was not justified either (p-value = %f).\n", pval))
-    } else {
-        cat(sprintf("But merging the last 3 bins of POWER_binned was justified (p-value = %f).\n", pval))
-        plot(plot_claim_freq(data, "POWER_binned_merged"))
-    }
+    cat(sprintf("Merging the last 3 bins of POWER_binned was not justified (p-value = %f).\n", pval))
+    data$POWER_binned_merged <- NULL
 } else {
-    cat(sprintf("Merging the last 4 bins of POWER_binned was justified (p-value = %f).\n", pval))
+    cat(sprintf("Merging the last 3 bins of POWER_binned was justified (p-value = %f).\n", pval))
     plot(plot_claim_freq(data, "POWER_binned_merged"))
 }
 ```
@@ -1212,25 +1215,25 @@ result_pop <- iv_elbow(data_enriched, "POPULATION", "NCLAIMS", baseline_pop)
 plot_iv_elbow(result_pop)
 ```
 
-Based on the elbow plot, we can see the WoE and IV for 3, 7 and 30 bins:
+Based on the elbow plot, we can look at the WoE and IV for 5, 6, 7 and 30 bins:
 
 ```{r woe_population}
 plots_pop <- list()
-for (i in c(3, 7, 30)) {
+for (i in c(5, 6, 7, 30)) {
     temp_bins_pop <- rebuild_bins(result_pop, i)
     woe_temp_pop <- woe_calc(data_enriched, x = "POPULATION", y = "NCLAIMS", bins = temp_bins_pop)
     plots_pop[[i]] <- plot_woe_iv(woe_temp_pop, interactive = FALSE)
 }
-(plots_pop[[3]] | plots_pop[[7]]) / (plots_pop[[30]])
+(plots_pop[[5]] | plots_pop[[6]]) / (plots_pop[[7]] | plots_pop[[30]])
 ```
 
 We see a linear diminution of the WoE as the population increases, indicating that higher population areas tend to have higher claim frequencies as we expected.
-The linear trend seems well captured with 7 bins. We'll create the new binned variable with 7 levels.
+The linear trend seems sufficiently captured with 6 bins. We'll create the new binned variable with 6 levels.
 
 ```{r binned_population}
 data_enriched$POPULATION_binned <- cut(
     data_enriched$POPULATION,
-    breaks = rebuild_bins(result_pop, 7),
+    breaks = rebuild_bins(result_pop, 6),
     include.lowest = TRUE,
     ordered_result = TRUE
 )
@@ -1238,25 +1241,25 @@ data_enriched$POPULATION_binned <- addNA(data_enriched$POPULATION_binned)
 m0 <- glm(NCLAIMS ~ offset(log(EXP)), data = data_enriched, family = poisson(link = "log"))
 m1 <- glm(NCLAIMS ~ POPULATION_binned + offset(log(EXP)), data = data_enriched, family = poisson(link = "log"))
 chisq_result <- anova(m0, m1, test = "Chisq")
-sprintf("Is the effect of POPULATION_binned significant at 95%% confidence? %s", ifelse(chisq_result$`Pr(>Chi)`[2] < 0.05, "Yes", "No"))
+cat(sprintf("Is the effect of POPULATION_binned significant at 95%% confidence? %s", ifelse(chisq_result$`Pr(>Chi)`[2] < 0.05, "Yes", "No")))
 plot_claim_freq(data_enriched, "POPULATION_binned")
 ```
 
-The variable is significant at 95% confidence, however we see that the 4 largest population bins have very similar claim frequencies, we can try merging them. Based on the confidence interval, we can also consider combining bin one and two. We would then get close to the 3 level binning we saw in the WoE and IV graphs above.
+The variable is significant at 95% confidence, however we see that the 3 largest population bins have very similar claim frequencies, we can try merging them. Based on the confidence interval, we can also consider combining bin one and two. We would then get have a simple three-level binning (Low, Medium, High Density).
 
 ```{r merged_population}
 initial_bins_merged <- data_enriched$POPULATION_binned
 
 last_bins_merged <- fct_collapse(
     data_enriched$POPULATION_binned,
-    "(3.66e+04,4.53e+05]" = c("(3.66e+04,6.79e+04]", "(6.79e+04,1.05e+05]", "(1.05e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
+    "(4.58e+04,4.53e+05]" = c("(4.58e+04,1.05e+05]", "(1.05e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
 )
 
 three_bins_merged <- fct_collapse(
     data_enriched$POPULATION_binned,
     "Low Density" = c("[995,4.56e+03]", "(4.56e+03,8.75e+03]"),
-    "Medium Density" = c("(8.75e+03,3.66e+04]"),
-    "High Density" = c("(3.66e+04,6.79e+04]", "(6.79e+04,1.05e+05]", "(1.05e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
+    "Medium Density" = c("(8.75e+03,4.58e+04]"),
+    "High Density" = c("(4.58e+04,1.05e+05]", "(1.05e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
 )
 
 m2 <- glm(NCLAIMS ~ offset(log(EXP)) + initial_bins_merged, data = data_enriched, family = poisson(link = "log"))
@@ -1265,7 +1268,7 @@ m0 <- glm(NCLAIMS ~ offset(log(EXP)) + three_bins_merged, data = data_enriched, 
 anova(m0, m1, m2, test = "Chisq")
 ```
 
-Based on the result of the anova test, it seems that merging the bins into three levels does not significantly increase the marginal deviance. We'll therefore adopt the three-level binning for the population variable which is a lot easier to interpret and work with.
+Based on the result of the anova test, it seems that merging the bins into three levels does not significantly increase the residual deviance. We'll therefore adopt the three-level binning for the population variable which is a lot easier to interpret and work with.
 
 ```{r three_bins_plot}
 data_enriched$POPULATION_binned <- three_bins_merged
@@ -1298,7 +1301,7 @@ data_enriched$REGION_merged <- merged_regions
 m0 <- glm(NCLAIMS ~ offset(log(EXP)) + REGION, data = data_enriched, family = poisson(link = "log"))
 m1 <- glm(NCLAIMS ~ offset(log(EXP)) + REGION_merged, data = data_enriched, family = poisson(link = "log"))
 test_result <- anova(m0, m1, test = "Chisq")
-sprintf("Was it justified to merge the REGION bins? %s", ifelse(test_result$`Pr(>Chi)`[2] < test_level, "No", "Yes"))
+cat(sprintf("Was it justified to merge the REGION bins? %s", ifelse(test_result$`Pr(>Chi)`[2] < test_level, "No", "Yes")))
 plot_claim_freq(data_enriched, "REGION_merged")
 ```
 
@@ -1448,6 +1451,11 @@ pheatmap(correlation_matrix,
 )
 ```
 
+We first notice that `AGEC`is not significantly correlated with `NCLAIMS` when considered with the first and second-degree polynomial features.
+As we saw before, the non-linear effect is captures in our binning. An alternative approach could have been to use the third-degree polynomial.
+We would still have the issue of fixed effects being imposed by the polynomial terms, which might not fully capture the underlying non-linear relationship.
+This is a good example of why binning can sometimes be more flexible in capturing non-linear relationships compared to fixed polynomial terms.
+
 We notice that the correllations between the polynomial features of a same variable are similar, this is foreseeable given that higher-degree polynomials are derived from the lower-degree ones.
 We are here exposed to multicollinearity issues. A solution is to check the **orthogonal polynomial features** instead of the raw ones, as they are uncorrelated by construction.
 This also enables us to differentiate the individual contributions of each polynomial term more clearly in the modeling process (linear, quadratic, cubic).
@@ -1484,7 +1492,6 @@ pheatmap(orth_correlation_matrix,
     number_format = "%.4f",
     breaks = c(0, 0.01, 0.05, 1),
     color = c("lightgreen", "white", "lightcoral"),
-
     legend = FALSE,
     cluster_rows = FALSE,
     cluster_cols = FALSE
@@ -1492,20 +1499,138 @@ pheatmap(orth_correlation_matrix,
 ```
 
 From this orthogonal polynomial feature exploration we can conclude that:
+
 - Polynomial features are more significantly correlated with the number of claims (`NCLAIMS`) than with the average claim amount (`AVG`).
 - Orthogonal polynomial features help assess whether each polynomial term contributes significantly to the relationship with the target variables, without being confounded by multicollinearity.
-- The orthogonal polynomial terms seems relevant for `AGEPH`, `POPULATION`.
-- For the bonus-malus `BM` variable, only the linear and cubic terms appear to be significant.
+- There is no clear rule to know if first, second, and/or third-degree polynomial terms are significant. The WoE-based binning approach provides a more flexible and interpretable way to capture non-linear effects.
 
-In conclusion, we could bin the quadratic and cubic orthogonal polynomial terms to provide more significant features for modelling.
-However, polynomial, and more specifically orthogonal polynomial, features are quite complex to interpret and we will not add them in the GLM models in the scope of this assignment.
-We will only see if the smoothing functions of the GAM models confirm the conclusions drawn from our exploratory analysis.
+In conclusion, polynomials are a way to capture non-linear relationships. However, the incremental effect of these polynomial terms is still fixed in a GLM.
+We therefore prefer working with binned features rather than relying solely on polynomial terms.
+We will nevertheless see if the smoothing functions of the GAM models confirm the conclusions drawn from our exploratory analysis.
 
 ### Interaction Features
 
+Interactions are usually added as a result of business knowledge. In our case, we know from a theorical background that the age of the policyholder interacts with the power of the car.
+We can add this interaction effect and test its significance in our models. Instead of manually testing all possible combinations. We'll use a decision tree approach which nature is to look for interactions and splits that best explain the variability in the target variable.
+With a shallow decision tree (depth of 3), we can identify the most relevant interactions without overfitting the data.
+Watch out the decision trees are not robusts and can be sensitive to small changes in the data. We'll do a 10-fold cross-validation to mitigate this issue.
+
+```{r interaction-tree}
+
+tree_model <- rpart(
+    NCLAIMS ~ COVERAGE_BIN + FUEL + FLEET + SEX + # Categorical features
+    BM_binned + AGEPH_binned_merged + AGEC_binned + POWER_binned_merged + # Binned numerical features
+    POPULATION_binned + REGION_merged + MUNICIPALITY_binned, # Enriched features
+    data = data_enriched,
+    method = "poisson",
+    control = rpart.control(maxdepth = 3, xval = 10, cp = 0)
+)
+rpart.plot(tree_model)
+
+importance_df <- data.frame(
+    feature = names(tree_model$variable.importance),
+    importance = tree_model$variable.importance %>% `/`(sum(.))
+)
+importance_df <- importance_df %>% arrange(desc(importance))
+
+ggplot(importance_df, aes(x = reorder(feature, importance), y = importance)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    coord_flip() +
+    labs(title = "Feature Importance in Decision Tree",
+            x = "Feature",
+            y = "Importance Score") +
+    theme_minimal()
+```
+
+Based on this machine learning approach, we can identify both specific interactions and the most important features that influence the target variable. When adding interaction terms to our models, we can thus consider:
+
+**Specific Interactions:** representing the two first splits identified by the decision tree.
+
+- `BM_binned.[0,1]` x `FUEL.gasoline`
+- `BM_binned.[0,1]` x `!FUEL.gasoline`
+- `!BM_binned.[0,1]` x `REGION_merged.Others`: will not add it as it is captured below already
+- `!BM_binned.[0,1]` x `!REGION_merged.Others`: will not add it as it is captured below already
+
+```{r specific-interactions}
+data_enriched <- data_enriched %>%
+    mutate(
+        BM_01_FUEL_gasoline = BM_binned == "[0,1]" & FUEL == "gasoline",
+        BM_01_FUEL_not_gasoline = BM_binned == "[0,1]" & FUEL != "gasoline"
+    )
+```
+
+**Variable Interactions:** representing the 3 most important features identified by the decision tree.
+
+- `BM_binned` x `AGEPH_binned_merged`
+- `REGION_merged` x `POWER_binned_merged`
+- `BM_binned` x `REGION_merged`
+
 # Modelling
 
+Now that we have explored, transformed, and enriched our data. We are ready to proceed with the modelling phase. We have a rich set of features to gradually incorporate into our models to improve predictive performance.
+We will also clean all intermediary objects that won't be used for modelling.
+
+```{r prep_modelling}
+# Clean intermediary objects not used for modelling
+functions <- ls()[sapply(ls(), function(x) is.function(get(x)))]
+rm(list = setdiff(ls(), c("data", "data_enriched", "conv_matching", "refnis", "pop", functions)))
+cat(sprintf("Remaining objects and functions: %s", paste(ls(), collapse = ", ")))
+
+original_categorical_features <- c("COVERAGE_BIN", "FUEL", "FLEET", "SEX")
+continuous_features <- c("BM", "AGEPH", "AGEC", "POWER")
+binned_continuous_features <- c("BM_binned", "AGEPH_binned_merged", "AGEC_binned", "POWER_binned_merged")
+enriched_features <- c("REGION_merged", "MUNICIPALITY_merged", "POPULATION")
+binned_enriched_features <- c("REGION_merged", "MUNICIPALITY_merged", "POPULATION_binned")
+interaction_features <- c("BM_01_FUEL_gasoline", "BM_01_FUEL_not_gasoline", "BM_binned:AGEPH_binned_merged", "REGION_merged:AGEPH_binned_merged", "BM_binned:REGION_merged")
+```
+
+**Original Categorical Features:**
+Note that `USE` was excluded because it was not statistically significant in preliminary analyses. And `COVERAGE` was transformed into `COVERAGE_BIN` after merging the partial and full omnium levels that did not significantly add information.
+
+- `COVERAGE_BIN`
+- `FUEL`
+- `FLEET`
+- `SEX`
+
+**Continuous Features:**
+The continuous features as such will be included in the GAM models only. We binned and merged them into categorical variables for the GLM modelling.
+
+- `BM` -> `BM_binned`
+- `AGEPH` -> `AGEPH_binned_merged`
+- `AGEC` -> `AGEC_binned`
+- `POWER` -> `POWER_binned_merged`
+
+**Enriched Features:**
+Based on geospation information, we have created, binned and merged both categorical and continuous features to capture urban/rural distinctions and municipality-level characteristics.
+
+- `REGION_merged`
+- `MUNICIPALITY_merged`
+- `POPULATION` -> `POPULATION_binned`
+
+**Interaction Features:**
+We have also created specific and variable interaction features based on expert knowledge and the decision tree analysis.
+
+- `POWER_binned_merged` x `AGEPH_binned_merged`: expert knowledge
+- `BM_01_FUEL_gasoline`: specific interaction based on decision tree analysis
+- `BM_01_FUEL_not_gasoline`: specific interaction based on decision tree analysis
+- `BM_binned` x `AGEPH_binned_merged`: variable interaction based on feature importance
+- `REGION_merged` x `AGEPH_binned_merged`: variable interaction based on feature importance
+- `BM_binned` x `REGION_merged`: variable interaction based on feature importance
+
+**Polynomial Features:**
+We also considered raw and orthogonal polynomial features for the continuous variables to capture potential non-linear relationships in the GAM models.
+We decided not to include them in the GLM models for the sake of model simplicity and interpretability. These polynomial effects will be naturally captured in the GAM models through the smooth functions.
+We will then be able to see whether the GAM results confirm our exploratory analysis.
+
 ## Validation Framework
+
+Remember that at the start of the Data Preparation chapter, we kept a holdout set separate from the training data for model validation purposes.
+We will now create a workflow including:
+
+- **Data Preparation**: enriching the dataset and transforming features as described in the previous sections.
+- **Model Training**: fitting the selected models to the prepared training data with a 5-fold cross-validation.
+- **Model Validation**: evaluating the performance of the trained models on the holdout set.
+
 
 ### Performance Metrics
 
