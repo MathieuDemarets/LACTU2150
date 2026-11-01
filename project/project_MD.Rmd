@@ -44,6 +44,7 @@ if (!require("pheatmap")) install.packages("pheatmap")
 if (!require("rpart")) install.packages("rpart")
 if (!require("rpart.plot")) install.packages("rpart.plot")
 if (!require("caret")) install.packages("caret")
+if (!require("recipes")) install.packages("recipes")
 
 library(dplyr)
 library(forcats)
@@ -56,6 +57,7 @@ library(pheatmap)
 library(rpart)
 library(rpart.plot)
 library(caret)
+library(recipes)
 
 ```
 
@@ -608,8 +610,11 @@ plot_iv_elbow <- function(iv_elbow_result, interactive = TRUE) {
 ```
 
 ```{r iv_elbow_result}
-result <- iv_elbow(data, "AGEPH", "NCLAIMS", bins_ageph)
-plot_iv_elbow(result, interactive = TRUE)
+result_named_list <- list()
+n_bins_named_list <- list()
+result_ageph <- iv_elbow(data, "AGEPH", "NCLAIMS", bins_ageph)
+result_named_list[["AGEPH"]] <- result_ageph
+plot_iv_elbow(result_ageph, interactive = TRUE)
 ```
 
 Looking at the IV elbow plot and taking the number of bins corresponding to the first maximum difference in IV as the optimal choice, we can rebuild the bins with only three bins. Adding a single bin seems sensible as we capture more information with a single additional split.
@@ -627,7 +632,7 @@ rebuild_bins <- function(iv_elbow_result, n) {
 ```{r rebuild_bins_result}
 plots <- list()
 for (i in c(3, 4, 7, 12)) {
-    temp_bins <- rebuild_bins(result, i)
+    temp_bins <- rebuild_bins(result_ageph, i)
     woe_temp <- woe_calc(data, x = "AGEPH", y = "NCLAIMS", bins = temp_bins)
     plots[[i]] <- plot_woe_iv(woe_temp, interactive = FALSE)
 }
@@ -646,8 +651,9 @@ The complex pattern we noticed in our initial `r length(bins_ageph) - 1` bins se
 # We add the ordered factor variable for the binned AGEPH
 data$AGEPH_binned <- cut(
     data$AGEPH, 
-    breaks = rebuild_bins(result, 7), include.lowest = TRUE, ordered_result = TRUE)
+    breaks = rebuild_bins(result_ageph, 7), include.lowest = TRUE, ordered_result = TRUE)
 # Check the distribution of the binned variable
+n_bins_named_list[["AGEPH"]] <- 7
 summary(data$AGEPH_binned) %>%
     kable(
         caption = "Distribution of binned AGEPH",
@@ -660,6 +666,7 @@ summary(data$AGEPH_binned) %>%
 ```{r bm_binning}
 baseline_bm <- qbinning(data, x = "BM", y = "NCLAIMS", max_bins = 30)
 result_bm <- iv_elbow(data, "BM", "NCLAIMS", baseline_bm)
+result_named_list[["BM"]] <- result_bm
 plot_iv_elbow(result_bm, interactive = TRUE)
 ```
 
@@ -683,6 +690,7 @@ Adding bins just creates bins in between with low informational value.
 data$BM_binned <- cut(
     data$BM,
     breaks = rebuild_bins(result_bm, 3), include.lowest = TRUE, ordered_result = TRUE)
+n_bins_named_list[["BM"]] <- 3
 ```
 
 #### Age of the Car Binning (AGEC)
@@ -690,6 +698,7 @@ data$BM_binned <- cut(
 ```{r agec_binning}
 baseline_agec <- qbinning(data, x = "AGEC", y = "NCLAIMS", max_bins = 30)
 result_agec <- iv_elbow(data, "AGEC", "NCLAIMS", baseline_agec)
+result_named_list[["AGEC"]] <- result_agec
 plot_iv_elbow(result_agec, interactive = TRUE)
 ```
 
@@ -719,6 +728,7 @@ data$AGEC_binned <- cut(
     data$AGEC,
     breaks = rebuild_bins(result_agec, 5)
     , include.lowest = TRUE, ordered_result = TRUE)
+n_bins_named_list[["AGEC"]] <- 5
 ```
 
 #### Power Binning (POWER)
@@ -726,6 +736,7 @@ data$AGEC_binned <- cut(
 ```{r power_}
 baseline_power <- qbinning(data, x = "POWER", y = "NCLAIMS", max_bins = 30)
 result_power <- iv_elbow(data, "POWER", "NCLAIMS", baseline_power)
+result_named_list[["POWER"]] <- result_power
 plot_iv_elbow(result_power, interactive = TRUE)
 ```
 
@@ -757,6 +768,7 @@ data$POWER_binned <- cut(
     data$POWER,   
     breaks = rebuild_bins(result_power, 8),
     include.lowest = TRUE, ordered_result = TRUE)
+n_bins_named_list[["POWER"]] <- 8
 ```
 
 We will end this Data Transformation section here now that we have bins for both categorical and numerical variables.
@@ -1212,6 +1224,7 @@ Note that we have `r sum(is.na(data_enriched$POPULATION))` missing values in the
 ```{r binning_population}
 baseline_pop <- qbinning(data_enriched, "POPULATION", "NCLAIMS", max_bins = 30)
 result_pop <- iv_elbow(data_enriched, "POPULATION", "NCLAIMS", baseline_pop)
+result_named_list[["POPULATION"]] <- result_pop
 plot_iv_elbow(result_pop)
 ```
 
@@ -1237,6 +1250,7 @@ data_enriched$POPULATION_binned <- cut(
     include.lowest = TRUE,
     ordered_result = TRUE
 )
+n_bins_named_list[["POPULATION"]] <- 6
 data_enriched$POPULATION_binned <- addNA(data_enriched$POPULATION_binned)
 m0 <- glm(NCLAIMS ~ offset(log(EXP)), data = data_enriched, family = poisson(link = "log"))
 m1 <- glm(NCLAIMS ~ POPULATION_binned + offset(log(EXP)), data = data_enriched, family = poisson(link = "log"))
@@ -1573,15 +1587,25 @@ We will also clean all intermediary objects that won't be used for modelling.
 ```{r prep_modelling}
 # Clean intermediary objects not used for modelling
 functions <- ls()[sapply(ls(), function(x) is.function(get(x)))]
-rm(list = setdiff(ls(), c("data", "data_enriched", "conv_matching", "refnis", "pop", functions)))
+rm(list = setdiff(ls(), c(
+    "data", "data_enriched", "holdout", "mtpl_be"
+    "conv_matching", "refnis", "pop", 
+    "result_named_list", "n_bins_named_list",
+    functions)))
 cat(sprintf("Remaining objects and functions: %s", paste(ls(), collapse = ", ")))
 
 original_categorical_features <- c("COVERAGE_BIN", "FUEL", "FLEET", "SEX")
 continuous_features <- c("BM", "AGEPH", "AGEC", "POWER")
 binned_continuous_features <- c("BM_binned", "AGEPH_binned_merged", "AGEC_binned", "POWER_binned_merged")
-enriched_features <- c("REGION_merged", "MUNICIPALITY_merged", "POPULATION")
-binned_enriched_features <- c("REGION_merged", "MUNICIPALITY_merged", "POPULATION_binned")
+enriched_features <- c("REGION_merged", "MUNICIPALITY_binned", "POPULATION")
+binned_enriched_features <- c("REGION_merged", "MUNICIPALITY_binned", "POPULATION_binned")
 interaction_features <- c("BM_01_FUEL_gasoline", "BM_01_FUEL_not_gasoline", "BM_binned:AGEPH_binned_merged", "REGION_merged:AGEPH_binned_merged", "BM_binned:REGION_merged")
+
+levels_named_list <- list()
+for (col in c(original_categorical_features, binned_continuous_features, binned_enriched_features)) {
+    if (!col %in% colnames(data_enriched)) {stop(sprintf("Column %s is missing from data_enriched", col))}
+    levels_named_list[[col]] <- levels(data_enriched[[col]])
+}
 ```
 
 **Original Categorical Features:**
@@ -1631,8 +1655,159 @@ We will now create a workflow including:
 - **Model Training**: fitting the selected models to the prepared training data with a 5-fold cross-validation.
 - **Model Validation**: evaluating the performance of the trained models on the holdout set.
 
+### Data Preparation Workflow
 
-### Performance Metrics
+```{r data_prep_workflow}
+# Data enrichment
+
+data_enrichment <- function(input_data) {
+    if (!("PC" %in% colnames(input_data))) {stop("PC column is missing from raw_data")}
+    if (!("ID" %in% colnames(input_data))) {stop("ID column is missing from raw_data")}
+    if (!exists("conv_matching")) {stop("conv_matching object is missing")}
+    if (!exists("refnis")) {stop("refnis object is missing")}
+    if (!exists("pop")) {stop("pop object is missing")}
+    output_data <- input_data %>%
+        mutate(TEMP_PC = as.integer(PC)) %>%
+        left_join(select(conv_matching, c("Postal.code","Refnis.code")), by = c("TEMP_PC" = "Postal.code")) %>%
+        left_join(select(refnis, c("NIS_MUN", "MUNICIPALITY", "REGION")), by = c("Refnis.code" = "NIS_MUN")) %>%
+        left_join(select(pop, c("NIS.code", "Totaal")), by = c("Refnis.code" = "NIS.code")) %>%
+        rename(
+            REFNIS = Refnis.code,
+            MUNICIPALITY = MUNICIPALITY,
+            REGION = REGION,
+            POPULATION = Totaal
+        ) %>%
+        select(-TEMP_PC) %>%
+        mutate(
+            POPULATION = as.numeric(gsub("\\.", "", POPULATION))
+        )
+    if (any(duplicated(output_data$ID))) {stop("Duplicated IDs found in enriched_data")}
+    if (nrow(output_data) != nrow(input_data)) {stop("Row count mismatch between enriched_data and raw_data")}    
+    return(output_data)
+}
+
+# Step 2: Data Preparation
+
+data_preparation_original_categorical <- function(input_data) {
+    # Convert original categorical features to factors and validate their levels
+    if (!exists("original_categorical_features")) {stop("original_categorical_features object is missing")}
+    if (!exists("levels_named_list")) {stop("levels_named_list object is missing")}
+    temp_data <- input_data
+    for (col in original_categorical_features) {
+        base_col <- col %>% gsub("_binned", "", .) %>% gsub("_merged", "", .) %>% gsub("_BIN", "", .)
+        if (!base_col %in% colnames(temp_data)) {stop(sprintf("Column %s is missing from input_data", base_col))}
+        temp_data[[base_col]] <- as.factor(temp_data[[base_col]])
+    }
+    temp_data$COVERAGE_BIN <- temp_data$COVERAGE %>% fct_collapse(
+        "TPL" = c("TPL"),
+        "OMN" = c("PO", "FO")
+    )
+    for (col in original_categorical_features) {
+        temp_data[[col]] <- factor(temp_data[[col]], levels = levels_named_list[[col]])
+    }
+    output_data <- temp_data
+    return(output_data)
+}
+
+data_preparation_binned_continuous <- function(input_data) {
+    if (!exists("result_named_list")) {stop("result_named_list object is missing")}
+    if (!exists("n_bins_named_list")) {stop("n_bins_named_list object is missing")}
+    if (!exists("binned_continuous_features")) {stop("binned_continuous_features object is missing")}
+    temp_data <- input_data
+    for (col in binned_continuous_features) {
+        base_col <- col %>% gsub("_binned", "", .) %>% gsub("_merged", "", .)
+        if (!base_col %in% colnames(temp_data)) {stop(sprintf("Column %s is missing from input_data", base_col))}
+        result <- result_named_list[[base_col]]
+        n_bins <- n_bins_named_list[[base_col]]
+        bins <- rebuild_bins(result, n_bins)
+        temp_data[[paste0(base_col, "_binned")]] <- cut(temp_data[[base_col]], breaks = bins, ordered_result = TRUE, include.lowest = TRUE)
+        if (length(unique(temp_data[[paste0(base_col, "_binned")]])) != n_bins) {stop(sprintf("Binning mismatch for column %s", base_col))}
+    }
+    temp_data$AGEPH_binned_merged <- temp_data$AGEPH_binned %>% fct_collapse(
+        "(66,95]" = c("(66,68]", "(68,71]", "(71,95]"))
+    temp_data$POWER_binned_merged <- temp_data$POWER_binned %>% fct_collapse(
+        "(66,243]" = c("(66,83]", "(83,99]", "(99,243]")
+    )
+    for (col in binned_continuous_features) {
+        temp_data[[col]] <- factor(temp_data[[col]], levels = levels_named_list[[col]])
+    }
+    output_data <- temp_data
+    return(output_data)
+}
+
+data_preparation_enriched <- function(input_data) {
+    temp_data <- input_data
+    if (!"POPULATION" %in% colnames(temp_data)) {stop("Column POPULATION is missing from input_data")}
+    if (!"REGION" %in% colnames(temp_data)) {stop("Column REGION is missing from input_data")}
+    if (!"MUNICIPALITY" %in% colnames(temp_data)) {stop("Column MUNICIPALITY is missing from input_data")}
+    temp_data$POPULATION_binned <- cut(temp_data$POPULATION, breaks = rebuild_bins(
+        result_named_list[["POPULATION"]], n_bins_named_list[["POPULATION"]]
+    ), ordered_result = TRUE, include.lowest = TRUE) %>%
+    addNA() %>%
+    fct_collapse(
+        "Low Density" = c("[995,4.56e+03]", "(4.56e+03,8.75e+03]"),
+        "Medium Density" = c("(8.75e+03,4.58e+04]"),
+        "High Density" = c("(4.58e+04,1.05e+05]", "(1.05e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
+    )
+    temp_data$REGION_merged <- temp_data$REGION %>% as.factor() %>%
+        fct_collapse(
+            "Brussels" = c("RÉGION DE BRUXELLES-CAPITALE"),
+            "Others" = c("RÉGION WALLONNE", "RÉGION FLAMANDE")
+        )
+    temp_data$MUNICIPALITY_binned <- ifelse(temp_data$MUNICIPALITY %in% levels_named_list[["MUNICIPALITY_binned"]], temp_data$MUNICIPALITY, "Other") %>%
+        as.factor()
+    for (col in binned_enriched_features) {
+        temp_data[[col]] <- factor(temp_data[[col]], levels = levels_named_list[[col]])
+    }
+    output_data <- temp_data
+    return(output_data)
+}
+
+data_preparation_interaction <- function(input_data) {
+    if (!"BM_binned" %in% colnames(input_data)) {stop("Column BM_binned is missing from input_data")}
+    if (!"FUEL" %in% colnames(input_data)) {stop("Column FUEL is missing from input_data")}
+    temp_data <- input_data %>%
+        mutate(
+            BM_01_FUEL_gasoline = BM_binned == "[0,1]" & FUEL == "gasoline",
+            BM_01_FUEL_not_gasoline = BM_binned == "[0,1]" & FUEL != "gasoline"
+        )
+    output_data <- temp_data
+    return(output_data)
+}
+
+data_preparation_workflow <- function(input_data) {
+    temp_data <- input_data %>%
+        data_enrichment %>%
+        data_preparation_original_categorical %>%
+        data_preparation_binned_continuous %>%
+        data_preparation_enriched %>%
+        data_preparation_interaction
+    output_data <- temp_data
+    return(output_data)
+}
+```
+
+```{r test_data_preparation_enriched}
+
+test_data <- mtpl_be %>%
+    filter(ID %in% data$ID) %>%
+    data_preparation_workflow()
+
+for (col in c(original_categorical_features, binned_continuous_features, enriched_features)) {
+    if (!col %in% colnames(test_data)) {
+        stop(paste("Column", col, "is missing from test_data"))
+    }
+    if (!identical(test_data[[col]], data_enriched[[col]])) {
+        stop(paste("Column", col, "does not match the enriched data"))
+    }
+}
+
+cat(sprintf("All columns in test_data match the enriched data.\n(%s)", paste(c(original_categorical_features, binned_continuous_features, enriched_features), collapse = ", ")))
+```
+
+### Model Training
+
+### Model Validation
 
 ### Statistical Tests
 
