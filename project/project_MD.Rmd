@@ -40,7 +40,7 @@ if (!require("knitr")) install.packages("knitr")
 if (!require("ggplot2")) install.packages("ggplot2")
 if (!require("plotly")) install.packages("plotly")
 if (!require("patchwork")) install.packages("patchwork")
-
+if (!require("pheatmap")) install.packages("pheatmap")
 
 library(dplyr)
 library(forcats)
@@ -49,6 +49,7 @@ library(knitr)
 library(ggplot2)
 library(plotly)
 library(patchwork)
+library(pheatmap)
 ```
 
 # Executive Summary
@@ -1398,6 +1399,107 @@ We then seem to capture something more than the simple urban-rural divide which 
 [^projection]: Coordinate Reference System are identifiers to explain how the projection from a 3D sphere to a 2D plane is performed. The Belgian Lambert 2008 (3812) projection is commonly used for visualizing geographical data in Belgium.
 
 ### Polynomial Features
+
+For the five numerical variables, we will consider the polynomial features up to the third degree to capture potential non-linear relationships with the response variable.
+This is an intermediate step towards the GAM models where we will explicitly model non-linear effects.
+Note that:
+- We will use Pearson correlation (continuous variables) instead of Spearman correlation because the rank-rank approach won't help us differentiate between the polynomial features of the same positive variable (ranks are maintained).
+- We will look at the p-values of the correlation tests instead of the correlation coefficients themselves to assess the significance of the relationships.
+- For the correlation with average claim amount (`AVG`), we will only consider the claims where `NCLAIMS` is greater than zero.
+- Orthogonal polynomial features will be considered separately to avoid multicollinearity issues inherent in raw polynomial features.
+- To compute orthogonal polynomial features, we will filter out the NA values from the data.
+
+```{r polynomial_features}
+numerical_continuous <- c("BM", "AGEPH", "AGEC", "POWER", "POPULATION")
+
+polynomial_features <- lapply(numerical_continuous, function(var) {
+    poly(data_enriched[[var]], degree = 3, raw = TRUE)
+})
+names(polynomial_features) <- numerical_continuous
+# Initialize data frame with proper structure
+correlation_matrix <- data.frame(
+    matrix(NA, nrow = length(numerical_continuous), ncol = 6)
+)
+rownames(correlation_matrix) <- numerical_continuous
+colnames(correlation_matrix) <- c(
+    "Claims Poly1", "Claims Poly2", "Claims Poly3",
+    "Avg Poly1", "Avg Poly2", "Avg Poly3")
+
+# Fill the matrix
+for (var in numerical_continuous) {
+    poly_values <- polynomial_features[[var]]
+    for (j in 1:3) {
+        correlation_matrix[var, j] <- cor.test(data_enriched[["NCLAIMS"]], poly_values[, j], method = "pearson")$p.value
+        claims_only_avg <- data_enriched[["AVG"]][data_enriched[["NCLAIMS"]] > 0]
+        claims_only_poly_values <- poly_values[data_enriched[["NCLAIMS"]] > 0, j]
+        correlation_matrix[var, j + 3] <- cor.test(claims_only_avg, claims_only_poly_values, method = "pearson")$p.value
+    }
+}
+
+pheatmap(correlation_matrix,
+    main = "Correlation P-Values Heatmap - Polynomial Features\n(Green = Significant p<0.05, Red = Non-significant)",
+    display_numbers = TRUE,
+    number_format = "%.4f",
+    breaks = c(0, 0.01, 0.05, 1),
+    color = c("lightgreen", "white", "lightcoral"),
+    legend = FALSE,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE
+)
+```
+
+We notice that the correllations between the polynomial features of a same variable are similar, this is foreseeable given that higher-degree polynomials are derived from the lower-degree ones.
+We are here exposed to multicollinearity issues. A solution is to check the **orthogonal polynomial features** instead of the raw ones, as they are uncorrelated by construction.
+This also enables us to differentiate the individual contributions of each polynomial term more clearly in the modeling process (linear, quadratic, cubic).
+
+```{r orthogonal_polynomial_features}
+
+no_na <- na.omit(data_enriched)
+orthogonal_polynomial_features <- lapply(numerical_continuous, function(var) {
+    poly(no_na[[var]], degree = 3, raw = FALSE)
+})
+names(orthogonal_polynomial_features) <- numerical_continuous
+orth_correlation_matrix <- data.frame(
+    matrix(NA, nrow = length(numerical_continuous), ncol = 6)
+)
+rownames(orth_correlation_matrix) <- numerical_continuous
+colnames(orth_correlation_matrix) <- c(
+    "OrthClaims Poly1", "OrthClaims Poly2", "OrthClaims Poly3",
+    "OrthAvg Poly1", "OrthAvg Poly2", "OrthAvg Poly3")
+
+# Fill the matrix
+for (var in numerical_continuous) {
+    poly_values <- orthogonal_polynomial_features[[var]]
+    for (j in 1:3) {
+        orth_correlation_matrix[var, j] <- cor.test(no_na[["NCLAIMS"]], poly_values[, j], method = "pearson")$p.value
+        claims_only_avg <- no_na[["AVG"]][no_na[["NCLAIMS"]] > 0]
+        claims_only_poly_values <- poly_values[no_na[["NCLAIMS"]] > 0, j]
+        orth_correlation_matrix[var, j + 3] <- cor.test(claims_only_avg, claims_only_poly_values, method = "pearson")$p.value
+    }
+}
+
+pheatmap(orth_correlation_matrix,
+    main = "Correlation P-Values Heatmap - Orthogonal Polynomial Features\n(Green = Significant p<0.05, Red = Non-significant)",
+    display_numbers = TRUE,
+    number_format = "%.4f",
+    breaks = c(0, 0.01, 0.05, 1),
+    color = c("lightgreen", "white", "lightcoral"),
+
+    legend = FALSE,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE
+) 
+```
+
+From this orthogonal polynomial feature exploration we can conclude that:
+- Polynomial features are more significantly correlated with the number of claims (`NCLAIMS`) than with the average claim amount (`AVG`).
+- Orthogonal polynomial features help assess whether each polynomial term contributes significantly to the relationship with the target variables, without being confounded by multicollinearity.
+- The orthogonal polynomial terms seems relevant for `AGEPH`, `POPULATION`.
+- For the bonus-malus `BM` variable, only the linear and cubic terms appear to be significant.
+
+In conclusion, we could bin the quadratic and cubic orthogonal polynomial terms to provide more significant features for modelling.
+However, polynomial, and more specifically orthogonal polynomial, features are quite complex to interpret and we will not add them in the GLM models in the scope of this assignment.
+We will only see if the smoothing functions of the GAM models confirm the conclusions drawn from our exploratory analysis.
 
 ### Interaction Features
 
