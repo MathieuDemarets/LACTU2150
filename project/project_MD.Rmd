@@ -45,6 +45,10 @@ if (!require("rpart")) install.packages("rpart")
 if (!require("rpart.plot")) install.packages("rpart.plot")
 if (!require("caret")) install.packages("caret")
 if (!require("recipes")) install.packages("recipes")
+if (!require("rsample")) install.packages("rsample")
+if (!require("parsnip")) install.packages("parsnip")
+if (!require("workflows")) install.packages("workflows")
+if (!require("poissonreg")) install.packages("poissonreg")
 
 library(dplyr)
 library(forcats)
@@ -58,6 +62,11 @@ library(rpart)
 library(rpart.plot)
 library(caret)
 library(recipes)
+library(rsample)
+library(tidymodels)
+library(parsnip)
+library(workflows)
+library(poissonreg)
 
 ```
 
@@ -780,12 +789,18 @@ We will end this Data Transformation section here now that we have bins for both
 Based on all created bins, we can visualize the claim frequency across different bins for each variable. This is what we already did in our analysis of the relation between the age of the driver and claim frequency.
 Remember that the MLE (Maximum Likelihood Estimator) for the claim frequency based on the hypothesis that the claims follow a Poisson distribution is the following:
 
-$$ NCLAIMS \sim \text{Poisson}(e\times \lambda) \text{, where } e \text{ is the exposure and } \lambda \text{ is the claim frequency rate.} $$
-$$ \hat{\lambda} = \frac{\sum NCLAIMS}{\sum e} $$
-$$ \hat{\lambda} \sim \text{Normal}\left(\lambda, \frac{\lambda}{\sum_i d_i}\right) $$
+$$ NCLAIMS_{i} \sim \text{Poisson}(d_i\times \lambda) \text{, where } d_i \text{ is the exposure and } \lambda \text{ is the claim frequency rate.} $$
+$$ \hat{\lambda} = \frac{\sum_i NCLAIMS_i}{\sum_i d_i} $$
+$$ \hat{\lambda} \sim \text{Normal}\left(\hat{\lambda}, \frac{\hat{\lambda}}{\sum_i d_i}\right) $$
 
 We find the variance as the inverse of the fisher information (itself equal to $-\ell''(\widehat{\lambda})$)
 $$ \text{Var}(\widehat{\lambda}) \approx \mathcal{I}(\widehat{\lambda})^{-1} = \frac{\widehat{\lambda}}{\sum_i d_i}. $$
+
+Alternatively, with the gaussian approximation on $NCLAIMS_i$, we have:
+$$ NCLAIMS_i \sim \text{Normal}(d_i \times \lambda, d_i \times \lambda) $$
+$$ \hat{\lambda} = \frac{\sum_i NCLAIMS_i}{\sum_i d_i} $$
+$$ \hat{\lambda} \sim \text{Normal}\left(\frac{\sum_i d_i \lambda}{\sum_i d_i}, \frac{\sum_i d_i \lambda}{(\sum_i d_i)^2}\right) $$
+$$ \hat{\lambda} \sim \text{Normal}\left(\lambda, \frac{\lambda}{\sum_i d_i}\right) $$
 
 Based on this mathematical understanding, we can build a main plot which shows exposures, claims, and claim frequencies with their confidence intervals (95 and 99%) across different bins for each variable.
 
@@ -1588,7 +1603,7 @@ We will also clean all intermediary objects that won't be used for modelling.
 # Clean intermediary objects not used for modelling
 functions <- ls()[sapply(ls(), function(x) is.function(get(x)))]
 rm(list = setdiff(ls(), c(
-    "data", "data_enriched", "holdout", "mtpl_be"
+    "data", "data_enriched", "holdout", "mtpl_be",
     "conv_matching", "refnis", "pop", 
     "result_named_list", "n_bins_named_list",
     functions)))
@@ -1729,7 +1744,7 @@ data_preparation_binned_continuous <- function(input_data) {
         "(66,243]" = c("(66,83]", "(83,99]", "(99,243]")
     )
     for (col in binned_continuous_features) {
-        temp_data[[col]] <- factor(temp_data[[col]], levels = levels_named_list[[col]])
+        temp_data[[col]] <- factor(temp_data[[col]], levels = levels_named_list[[col]], ordered = FALSE)
     }
     output_data <- temp_data
     return(output_data)
@@ -1757,7 +1772,7 @@ data_preparation_enriched <- function(input_data) {
     temp_data$MUNICIPALITY_binned <- ifelse(temp_data$MUNICIPALITY %in% levels_named_list[["MUNICIPALITY_binned"]], temp_data$MUNICIPALITY, "Other") %>%
         as.factor()
     for (col in binned_enriched_features) {
-        temp_data[[col]] <- factor(temp_data[[col]], levels = levels_named_list[[col]])
+        temp_data[[col]] <- factor(temp_data[[col]], levels = levels_named_list[[col]], ordered = FALSE)
     }
     output_data <- temp_data
     return(output_data)
@@ -1793,6 +1808,11 @@ test_data <- mtpl_be %>%
     filter(ID %in% data$ID) %>%
     data_preparation_workflow()
 
+# Set ordered factors for binned continuous features to unordered
+for (col in names(levels_named_list)) {
+    data_enriched[[col]] <- factor(data_enriched[[col]], levels = levels_named_list[[col]], ordered = FALSE)
+}
+
 for (col in c(original_categorical_features, binned_continuous_features, enriched_features)) {
     if (!col %in% colnames(test_data)) {
         stop(paste("Column", col, "is missing from test_data"))
@@ -1805,19 +1825,280 @@ for (col in c(original_categorical_features, binned_continuous_features, enriche
 cat(sprintf("All columns in test_data match the enriched data.\n(%s)", paste(c(original_categorical_features, binned_continuous_features, enriched_features), collapse = ", ")))
 ```
 
-### Model Training
-
-### Model Validation
-
-### Statistical Tests
-
 ### Cross-Validation
+
+To better understand cross-validation, let's illustrate it with a simple manual example.
+We create 5 data sets (folds) for cross-validation. Each fold will be used once as a validation set while the remaining folds form the training set.
+
+```{r illustration_cv}
+cv_split <- function(input_data, kfold, strata) {
+    folds <- input_data %>% vfold_cv(strata = strata, v = kfold)
+    return(folds)
+}
+base_formula <- "NCLAIMS ~ offset(log(EXP))"
+folds <- mtpl_be %>%
+    filter(ID %in% data$ID) %>%
+    data_preparation_workflow() %>%
+    cv_split(kfold = 5, strata = "NCLAIMS")
+models <- vector("list", length(folds$splits))
+poisson_log_loss_list <- list()
+beta0 <- list()
+for (i in seq_along(folds$splits)) {
+    train_data <- analysis(folds$splits[[i]])
+    val_data <- assessment(folds$splits[[i]])
+    models[[i]] <- glm(formula = as.formula(base_formula), data = train_data, family = poisson(link = "log"))
+    log_loss <- -mean(dpois(val_data$NCLAIMS, lambda = predict(models[[i]], newdata = val_data, type = "response"), log = TRUE))
+    poisson_log_loss_list[[i]] <- log_loss
+    beta0[[i]] <- coef(models[[i]])[1]
+}
+m0 <- glm(formula = as.formula(base_formula), data = mtpl_be %>% filter(ID %in% data$ID) %>% data_preparation_workflow(), family = poisson(link = "log"))
+beta0_full <- coef(m0)[1]
+log_loss_full <- -mean(dpois(holdout$NCLAIMS, lambda = predict(m0, newdata = holdout, type = "response"), log = TRUE))
+cat(sprintf("For the simple GLM model:\n  Log loss (-log-likelihood/n): %s\n  Intercept (beta0): %s\n  95%% CI for beta0: [%s, %s]\n", log_loss_full, beta0_full, beta0_full - 1.96 * summary(m0)$coefficients[1,2], beta0_full + 1.96 * summary(m0)$coefficients[1,2]))
+cat(sprintf("Cross-validated log loss: min = %s, mean = %s, max = %s\n", min(unlist(poisson_log_loss_list)), mean(unlist(poisson_log_loss_list)), max(unlist(poisson_log_loss_list))))
+cat(sprintf("Cross-validated beta0: min = %s, mean = %s, max = %s\n", min(unlist(beta0)), mean(unlist(beta0)), max(unlist(beta0))))
+```
+
+This illustrates how cross-validation enables enables to check the robustness and variability of the model's performance and parameter estimates across different subsets of the data.
+Comparing the cross-validated mean log loss, AIC or BIC across various models will yield a more robust choice for model selection. Now that the intuition is set, we can create our workflow including cross-validation.
+
+### Performance Metrics
+
+To compare the performance of different models, we can consider the following cross-validated metrics:
+
+- Log Loss: Measures predictive accuracy by evaluating the negative log-likelihood (scaled by the number of observations) of the observed outcomes given the predicted probabilities.
+- AIC (Akaike Information Criterion): Evaluates model quality by balancing goodness of fit and model complexity. Lower values indicate better models.
+- BIC (Bayesian Information Criterion): Similar to AIC, but with a stronger penalty for model complexity. Lower values indicate better models.
+
+Note that the `Log- Loss`, `AIC` and `BIC` are all based on the likelihood of the model, here are how they are computed:
+
+- Log Loss: `-mean(dpois(y, lambda = predicted_lambda, log = TRUE))` or `-logLik(model)/n` where `n` is the number of observations.
+- AIC: `2 * k - 2 * logLik(model)` where `k` is the number of parameters.
+- BIC: `log(n) * k - 2 * logLik(model)` where `n` is the number of observations and `k` is the number of parameters.
+
+We see that `Log loss`simply does not account for model complexity, unlike `AIC` and `BIC` which include penalties of 2 * k and `r log(nrow(data)*(4/5))`[^logn] * k respectively. 
+Because the penalty is so much higher, due to the large size of our portfolio, `BIC` tends to favor simpler models compared to `AIC`.
+
+[^logn]: The term `log(nrow(data)*(4/5))` comes from the fact that we are using cross-validation with 5 folds, so each training set contains 4/5 of the data.
+
+The models will be gradually complexified by adding covariates. For each step, we will compare the final model with the previous step based on:
+
+- Scaled Residual Deviance: Measures the goodness of fit of a model relative to a saturated model, scaled by the residual deviance of the null model.
+- Anova Test: Compares nested models by evaluating whether the addition of new covariates significantly improves the model fit.
+
+For the scaled residual deviance, here are the maximum and minimum deviance values:
+
+- Null Deviance: $D_0 = 2 \times \left(\logLik(SaturatedModel) - \logLik(NullModel)\right)$
+- Residual Deviance: $D_m = 2 \times \left(\logLik(SaturatedModel) - \logLik(FittedModel)\right)$
+- Scaled Residual Deviance: $D_s = \frac{D_m}{D_0}$
+
+```{r full_model_deviance}
+train_data <- mtpl_be %>%
+    filter(ID %in% data$ID) %>%
+    data_preparation_workflow()
+m_null <- glm(NCLAIMS ~ offset(log(EXP)), family = poisson, data = train_data)
+m_ex <- glm(NCLAIMS ~ offset(log(EXP)) + BM_binned, family = poisson, data = train_data)
+cat(sprintf(
+    "Scaled Residual Deviance: %.2f%% (%.0f / %.0f)", 
+    deviance(m_ex) / deviance(m_null)*100,
+    deviance(m_ex),
+    deviance(m_null)
+))
+
+ll_sat <- deviance(m_null)/2 + logLik(m_null)
+calc_dm <- 2 * (ll_sat - logLik(m_ex))
+cat(sprintf(
+    "Calculated D_m = %.2f and Model Deviance = %.0f", 
+    calc_dm,
+    deviance(m_ex)
+))
+cat(sprintf("We thus have maximum log likelihood for the saturated model: %.2f", ll_sat))
+cat(sprintf("And minimum log likelihood for the null model: %.2f", logLik(m_null)))
+```
+
+The anova test will be comparing the deviance of the nested models to evaluate whether the addition of new covariates significantly improves the model fit.
+
+```{r anova_test}
+anova(m_null, m_ex, test = "Chisq")
+```
 
 ## Frequency Modelling
 
-### Naive and Full Models
+Based on all the notions explained in the Validation Framework: data preparation, cross-validation, and performance metrics, we will now create workflows for frequency modelling.
 
 ### GLM Models
+
+```{r glm_workflow}
+
+create_wflow_freq_glm <- function(data, formula, v = 5, seed = 123) {
+
+    set.seed(seed)
+    folds <- vfold_cv(data, v = v, strata = NCLAIMS)
+
+    rec <- recipe(as.formula(formula), data = data)
+
+    # The Poisson family uses a log link by default
+    mod <- poisson_reg() %>%
+        set_engine("glm")
+
+    wflow <- workflow() %>%
+        add_recipe(rec) %>%
+        add_model(mod)
+
+    cv_results <- fit_resamples(
+        wflow,
+        resamples = folds,
+        control = control_resamples(save_pred = TRUE)
+    )
+
+    # Cross-validation does not fit a final model on all the data
+    final_fit <- fit(wflow, data = data)
+    glm_fit <- extract_fit_engine(final_fit)
+
+    # Cross-validated deviance
+    cv_pred <- collect_predictions(cv_results)
+    cv_deviance <- cv_pred %>%
+        mutate(deviance_i = poisson()$dev.resids(y= NCLAIMS, mu = .pred, wt = 1)) %>%
+        summarise(
+            total_deviance = sum(deviance_i),
+        )
+    cv_log_loss <- poisson_log_loss(cv_pred, truth = NCLAIMS, estimate = .pred)
+
+    list(
+        workflow = wflow,
+        folds = folds,
+        resamples = cv_results,
+        fit = glm_fit,
+        performance_metrics = list(
+            AIC = AIC(glm_fit),
+            BIC = BIC(glm_fit),
+            Deviance = deviance(glm_fit),
+            CV_Deviance = cv_deviance$total_deviance,
+            CV_LogLoss = cv_log_loss$.estimate
+        )
+    )
+}
+```
+
+#### Categorical Variables Only
+
+Let us start with adding the categorical variables only to our frequency model:
+
+- `COVERAGE_BIN`
+- `FLEET`
+- `SEX`
+- `FUEL`
+
+Note that `USE` was not significant in the preliminary analysis and thus is not included in the categorical variables for the frequency model.
+
+```{r categorical_variables}
+perf_metrics_df <- data.frame(
+    Model = character(),
+    AIC = numeric(),
+    BIC = numeric(),
+    Deviance = numeric(),
+    CV_Deviance = numeric(),
+    CV_LogLoss = numeric()
+)
+append_performance_metrics <- function(name, formula, result, perf_df = perf_metrics_df) {
+    perf <- result$performance_metrics
+    new_row <- data.frame(
+        Model = name,
+        AIC = perf$AIC,
+        BIC = perf$BIC,
+        Deviance = perf$Deviance,
+        CV_Deviance = perf$CV_Deviance,
+        CV_LogLoss = perf$CV_LogLoss
+    )
+    rbind(perf_df, new_row)
+}
+
+f0 <- "NCLAIMS ~ 1"
+fcat <- paste0("NCLAIMS ~ ", paste(original_categorical_features, collapse = " + "))
+cat(sprintf("> Categorical formula: %s", fcat))
+
+r0 <- create_wflow_freq_glm(train_data, f0)
+perf_metrics_df <- append_performance_metrics(name = "Intercept Only", formula = f0, result = r0)
+rcat <- create_wflow_freq_glm(train_data, fcat)
+perf_metrics_df <- append_performance_metrics(name = "Categorical Only", formula = fcat, result = rcat)
+
+perf_metrics_df %>% arrange(AIC) %>% knitr::kable(
+    booktabs = TRUE, caption = "Performance Metrics for Frequency Models After Adding Categorical Variables"
+)
+```
+
+```{r summary_rcat_fit}
+test <- anova(r0$fit, rcat$fit, test = "Chisq")
+cat(sprintf("Is the categorical model a significant improvement over the intercept-only model? %s (p-value = %.4f)\n", ifelse(test$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test$`Pr(>Chi)`[2]))
+
+delta_deviance <- r0$performance_metrics$CV_Deviance - rcat$performance_metrics$CV_Deviance
+diff_degree_of_freedom <- r0$fit$df.residual - rcat$fit$df.residual
+pvalue <- pchisq(delta_deviance, diff_degree_of_freedom, lower.tail = FALSE)
+cat(sprintf("Anova test based on CV Deviance: delta_deviance = %.4f, diff_degree_of_freedom = %d, p-value = %.4f\n", delta_deviance, diff_degree_of_freedom, pvalue))
+
+check_summary <- function(result) {
+    sum_mod <- summary(result$fit)
+    coefficients <- sum_mod$coefficients %>% as.data.frame()
+    coefficients$significant <- ifelse(coefficients[, "Pr(>|z|)"] < 0.05, "Yes", "No")
+    coefficients$multiplier <- exp(coefficients[, "Estimate"])
+    coefficients$multiplier_lb <- exp(coefficients[, "Estimate"] - 1.96 * coefficients[, "Std. Error"])
+    coefficients$multiplier_ub <- exp(coefficients[, "Estimate"] + 1.96 * coefficients[, "Std. Error"])
+    return(coefficients)
+}
+
+plot_summary <- function(result, add_text=FALSE) {
+    coefficients <- check_summary(result) 
+    mult_df <- coefficients %>% filter(rownames(coefficients) != "(Intercept)")
+    ggplot(mult_df, aes(x = rownames(mult_df), y = multiplier, ymin = multiplier_lb, ymax = multiplier_ub)) +
+        geom_pointrange() +
+        geom_hline(yintercept = 1, linetype = "dashed") +
+        {if(add_text) geom_text(
+            aes(label = round(multiplier, 2)), vjust = 2, 
+            color = ifelse(mult_df$multiplier > 1, "firebrick", "darkgreen")
+        ) else NULL} +
+        coord_flip() +
+        labs(x = "Coefficient", y = "Multiplier", title = sprintf("Coefficient Multipliers and 95%% CI\nBase Premium: %.2f", exp(result$fit$coefficients[1]))) +
+        theme_minimal()
+}
+coefs <- check_summary(rcat)
+plot_summary(rcat, add_text=TRUE)
+```
+
+We see that the anova test indicates that the more complex model with categorical variables is a significant improvement over the intercept-only model.
+We also observe that all the levels we kept are significant. The multipliers are in line with our expectations based on the data exploration:
+
+- Female drivers have a higher risk compared to male drivers: the multiplier for the female category is of `r coefs["SEXfemale", "multiplier"]` (95% CI: `r coefs["SEXfemale", "multiplier_lb"]` - `r coefs["SEXfemale", "multiplier_ub"]`)
+- Diesel cars are significantly more risky compared to gasoline cars: the multiplier for the diesel category is of `r coefs["FUELdiesel", "multiplier"]` (95% CI: `r coefs["FUELdiesel", "multiplier_lb"]` - `r coefs["FUELdiesel", "multiplier_ub"]`)
+- Cars that are part of a fleet have a lower risk compared to non-fleet cars: the multiplier for the fleet category is of `r coefs["FLEETY", "multiplier"]` (95% CI: `r coefs["FLEETY", "multiplier_lb"]` - `r coefs["FLEETY", "multiplier_ub"]`)
+- Drivers with an omnium coverage are at a lower risk compared to those with TPL only: the multiplier for the omnium category is of `r coefs["COVERAGE_BINOMN", "multiplier"]` (95% CI: `r coefs["COVERAGE_BINOMN", "multiplier_lb"]` - `r coefs["COVERAGE_BINOMN", "multiplier_ub"]`)
+
+We can conclude that the categorical variables were well-chosen in the EDA and have a significant impact in our model.
+The new model is better than the null model and needs no adaptation, so we can continue with the `rcat` model as our new baseline for further model development.
+
+#### Binned Continuous Variables
+
+Next, we will add the binned continuous variables to our model to capture the potential non-linear effects of continuous predictors on the frequency of claims:
+
+- BM_binned
+- AGEPH_binned_merged
+- AGEC_binned
+- POWER_binned_merged
+
+```{r binned_continuous_variables}
+fcontb <- paste0(fcat, " + ", paste(binned_continuous_features, collapse = " + "))
+cat(sprintf("> Full formula with binned continuous variables: %s", fcontb))
+
+rcontb <- create_wflow_freq_glm(train_data, fcontb)
+perf_metrics_df <- append_performance_metrics(name = "All Continuous Binned", formula = fcontb, result = rcontb)
+
+test <- anova(rcat$fit, rcontb$fit, test = "Chisq")
+cat(sprintf("Is the full model with binned continuous variables a significant improvement over the categorical model? %s (p-value = %.4f)\n", ifelse(test$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test$`Pr(>Chi)`[2]))
+
+coefs_contb <- check_summary(rcontb)
+plot_summary(rcontb)
+```
+
+
 
 ### GAM Models
 
