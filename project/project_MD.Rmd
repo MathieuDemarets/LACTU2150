@@ -1054,7 +1054,7 @@ if(pval < 0.05) {
 ```{r merge_power}
 data$POWER_binned_merged <- fct_collapse(
     data$POWER_binned, 
-    "(66,243]" = c("(66,83]", "(83,99]", "(99,243]")
+    "(76,243]" = c("(76,83]", "(83,99]", "(99,243]")
 )
 m0 <- glm(NCLAIMS ~ offset(log(EXP)) + POWER_binned, data = data, family = poisson(link = "log"))
 m1 <- glm(NCLAIMS ~ offset(log(EXP)) + POWER_binned_merged, data = data, family = poisson(link = "log"))
@@ -1221,7 +1221,8 @@ data_enriched <- data_enriched %>%
         REFNIS = factor(REFNIS) %>% fct_infreq(),
         MUNICIPALITY = factor(MUNICIPALITY) %>% fct_infreq(),
         REGION = factor(REGION) %>% fct_infreq(),
-        POPULATION = as.numeric(gsub("\\.", "", POPULATION))
+        POPULATION = as.numeric(gsub("\\.", "", POPULATION)),
+        POPULATION = ifelse(is.na(POPULATION), mean(POPULATION, na.rm = TRUE), POPULATION)
     )
 
 if(nrow(data) != nrow(data_enriched)) stop("The number of rows in the enriched data does not match the original data.")
@@ -1232,7 +1233,7 @@ kable(booktabs = TRUE, width = 100, caption = "Summary of Enriched Data")
 ```
 
 Now that we have the enriched data, we can bin the population density into categories and assess the significance of municipality, region, and population density.
-Note that we have `r sum(is.na(data_enriched$POPULATION))` missing values in the population column. We'll create a bin for these missing values as well.
+Note that we have `r sum(is.na(data_enriched$POPULATION))` missing values in the population column. We'll use mean imputation to fill these missing values before binning.
 
 #### Population Density
 
@@ -1243,30 +1244,29 @@ result_named_list[["POPULATION"]] <- result_pop
 plot_iv_elbow(result_pop)
 ```
 
-Based on the elbow plot, we can look at the WoE and IV for 5, 6, 7 and 30 bins:
+Based on the elbow plot, we can look at the WoE and IV for 5, 6, 12 and 20 bins:
 
 ```{r woe_population}
 plots_pop <- list()
-for (i in c(5, 6, 7, 30)) {
+for (i in c(5, 6, 12, 20)) {
     temp_bins_pop <- rebuild_bins(result_pop, i)
     woe_temp_pop <- woe_calc(data_enriched, x = "POPULATION", y = "NCLAIMS", bins = temp_bins_pop)
     plots_pop[[i]] <- plot_woe_iv(woe_temp_pop, interactive = FALSE)
 }
-(plots_pop[[5]] | plots_pop[[6]]) / (plots_pop[[7]] | plots_pop[[30]])
+(plots_pop[[5]] | plots_pop[[6]]) / (plots_pop[[12]] | plots_pop[[20]])
 ```
 
 We see a linear diminution of the WoE as the population increases, indicating that higher population areas tend to have higher claim frequencies as we expected.
-The linear trend seems sufficiently captured with 6 bins. We'll create the new binned variable with 6 levels.
+The linear trend seems sufficiently captured with 5 bins. We'll create the new binned variable with 5 levels.
 
 ```{r binned_population}
 data_enriched$POPULATION_binned <- cut(
     data_enriched$POPULATION,
-    breaks = rebuild_bins(result_pop, 6),
+    breaks = rebuild_bins(result_pop, 5),
     include.lowest = TRUE,
     ordered_result = TRUE
 )
-n_bins_named_list[["POPULATION"]] <- 6
-data_enriched$POPULATION_binned <- addNA(data_enriched$POPULATION_binned)
+n_bins_named_list[["POPULATION"]] <- 5
 m0 <- glm(NCLAIMS ~ offset(log(EXP)), data = data_enriched, family = poisson(link = "log"))
 m1 <- glm(NCLAIMS ~ POPULATION_binned + offset(log(EXP)), data = data_enriched, family = poisson(link = "log"))
 chisq_result <- anova(m0, m1, test = "Chisq")
@@ -1274,37 +1274,41 @@ cat(sprintf("Is the effect of POPULATION_binned significant at 95%% confidence? 
 plot_claim_freq(data_enriched, "POPULATION_binned")
 ```
 
-The variable is significant at 95% confidence, however we see that the 3 largest population bins have very similar claim frequencies, we can try merging them. Based on the confidence interval, we can also consider combining bin one and two. We would then get have a simple three-level binning (Low, Medium, High Density).
+The variable is significant at 95% confidence, however we see that the 3 largest population bins have very similar claim frequencies, we can try merging them to get have a simple three-level binning (Low, Medium, High Density).
 
 ```{r merged_population}
 initial_bins_merged <- data_enriched$POPULATION_binned
 
-last_bins_merged <- fct_collapse(
-    data_enriched$POPULATION_binned,
-    "(4.58e+04,4.53e+05]" = c("(4.58e+04,1.05e+05]", "(1.05e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
-)
-
 three_bins_merged <- fct_collapse(
     data_enriched$POPULATION_binned,
-    "Low Density" = c("[995,4.56e+03]", "(4.56e+03,8.75e+03]"),
-    "Medium Density" = c("(8.75e+03,4.58e+04]"),
-    "High Density" = c("(4.58e+04,1.05e+05]", "(1.05e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
+    "Low Density" = c("[995,7.68e+03]"),
+    "Medium Density" = c("(7.68e+03,4.3e+04]"),
+    "High Density" = c("(4.3e+04,1.34e+05]", "(1.34e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
 )
 
-m2 <- glm(NCLAIMS ~ offset(log(EXP)) + initial_bins_merged, data = data_enriched, family = poisson(link = "log"))
-m1 <- glm(NCLAIMS ~ offset(log(EXP)) + last_bins_merged, data = data_enriched, family = poisson(link = "log"))
+m1 <- glm(NCLAIMS ~ offset(log(EXP)) + initial_bins_merged, data = data_enriched, family = poisson(link = "log"))
 m0 <- glm(NCLAIMS ~ offset(log(EXP)) + three_bins_merged, data = data_enriched, family = poisson(link = "log"))
-anova(m0, m1, m2, test = "Chisq")
+test_pop <- anova(m0, m1, test = "Chisq")
+cat(sprintf("Are we loosing significant information by merging the population bins? %s (p-value: %.4f)", ifelse(test_pop$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_pop$`Pr(>Chi)`[2]))
+
+four_bins_merged <- fct_collapse(
+    data_enriched$POPULATION_binned,
+    "(1.34e+05,4.53e+05]" = c("(1.34e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
+)
+
+m0 <- glm(NCLAIMS ~ offset(log(EXP)) + four_bins_merged, data = data_enriched, family = poisson(link = "log"))
+test_pop_four <- anova(m0, m1, test = "Chisq")
+cat(sprintf("Are we loosing significant information by merging the last two population bins? %s (p-value: %.4f)", ifelse(test_pop_four$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_pop_four$`Pr(>Chi)`[2]))
 ```
 
 Based on the result of the anova test, it seems that merging the bins into three levels does not significantly increase the residual deviance. We'll therefore adopt the three-level binning for the population variable which is a lot easier to interpret and work with.
 
 ```{r three_bins_plot}
-data_enriched$POPULATION_binned <- three_bins_merged
+data_enriched$POPULATION_binned <- four_bins_merged
 plot_claim_freq(data_enriched, "POPULATION_binned")
 ```
 
-It is interesting to note that the `NA` bin looks similar to medium density with slightly more variability.
+We get a linear trend in claim frequency with respect to population density bins (ordinal variable).
 
 #### Regions
 
@@ -1694,7 +1698,10 @@ data_enrichment <- function(input_data) {
         ) %>%
         select(-TEMP_PC) %>%
         mutate(
-            POPULATION = as.numeric(gsub("\\.", "", POPULATION))
+            POPULATION = as.numeric(gsub("\\.", "", POPULATION)),
+        ) %>%
+        mutate(
+            POPULATION = ifelse(is.na(POPULATION), mean(POPULATION, na.rm = TRUE), POPULATION)
         )
     if (any(duplicated(output_data$ID))) {stop("Duplicated IDs found in enriched_data")}
     if (nrow(output_data) != nrow(input_data)) {stop("Row count mismatch between enriched_data and raw_data")}    
@@ -1741,7 +1748,7 @@ data_preparation_binned_continuous <- function(input_data) {
     temp_data$AGEPH_binned_merged <- temp_data$AGEPH_binned %>% fct_collapse(
         "(66,95]" = c("(66,68]", "(68,71]", "(71,95]"))
     temp_data$POWER_binned_merged <- temp_data$POWER_binned %>% fct_collapse(
-        "(66,243]" = c("(66,83]", "(83,99]", "(99,243]")
+        "(76,243]" = c("(76,83]", "(83,99]", "(99,243]")
     )
     for (col in binned_continuous_features) {
         temp_data[[col]] <- factor(temp_data[[col]], levels = levels_named_list[[col]], ordered = FALSE)
@@ -1758,11 +1765,8 @@ data_preparation_enriched <- function(input_data) {
     temp_data$POPULATION_binned <- cut(temp_data$POPULATION, breaks = rebuild_bins(
         result_named_list[["POPULATION"]], n_bins_named_list[["POPULATION"]]
     ), ordered_result = TRUE, include.lowest = TRUE) %>%
-    addNA() %>%
     fct_collapse(
-        "Low Density" = c("[995,4.56e+03]", "(4.56e+03,8.75e+03]"),
-        "Medium Density" = c("(8.75e+03,4.58e+04]"),
-        "High Density" = c("(4.58e+04,1.05e+05]", "(1.05e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
+        "(1.34e+05,4.53e+05]" = c("(1.34e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
     )
     temp_data$REGION_merged <- temp_data$REGION %>% as.factor() %>%
         fct_collapse(
@@ -1933,7 +1937,10 @@ Based on all the notions explained in the Validation Framework: data preparation
 create_wflow_freq_glm <- function(data, formula, v = 5, seed = 123) {
 
     set.seed(seed)
-    folds <- vfold_cv(data, v = v, strata = NCLAIMS)
+    folds <- vfold_cv(
+        data, v = v, 
+        strata = NCLAIMS
+    )
 
     rec <- recipe(as.formula(formula), data = data)
 
@@ -1958,7 +1965,7 @@ create_wflow_freq_glm <- function(data, formula, v = 5, seed = 123) {
     # Cross-validated deviance
     cv_pred <- collect_predictions(cv_results)
     cv_deviance <- cv_pred %>%
-        mutate(deviance_i = poisson()$dev.resids(y= NCLAIMS, mu = .pred, wt = 1)) %>%
+        mutate(deviance_i = poisson()$dev.resids(y = NCLAIMS, mu = .pred, wt = 1)) %>%
         summarise(
             total_deviance = sum(deviance_i),
         )
@@ -1979,6 +1986,17 @@ create_wflow_freq_glm <- function(data, formula, v = 5, seed = 123) {
     )
 }
 ```
+
+We created a workflow to:
+
+- Make the n folds (5 by default)
+- Add the new levels to a categorical variable "Other", particularly relevant for Municipalities with low frequency
+- Specify the Poisson regression model with a log link
+- Fit the model on the entire training dataset
+- Perform cross-validation to evaluate model performance
+- Store the workflow, cross-validation (Deviance and LogLoss) and final model fit
+
+This workflow will be used for all models in the frequency analysis, ensuring consistency in model fitting, cross-validation, and performance evaluation.
 
 #### Categorical Variables Only
 
@@ -2039,7 +2057,9 @@ cat(sprintf("Anova test based on CV Deviance: delta_deviance = %.4f, diff_degree
 check_summary <- function(result) {
     sum_mod <- summary(result$fit)
     coefficients <- sum_mod$coefficients %>% as.data.frame()
-    coefficients$significant <- ifelse(coefficients[, "Pr(>|z|)"] < 0.05, "Yes", "No")
+    coefficients$p.value <- coefficients[, "Pr(>|z|)"]
+    coefficients <- coefficients %>% select(Estimate, `Std. Error`, p.value)
+    coefficients$significant <- ifelse(coefficients$p.value < 0.05, "Yes", "No")
     coefficients$multiplier <- exp(coefficients[, "Estimate"])
     coefficients$multiplier_lb <- exp(coefficients[, "Estimate"] - 1.96 * coefficients[, "Std. Error"])
     coefficients$multiplier_ub <- exp(coefficients[, "Estimate"] + 1.96 * coefficients[, "Std. Error"])
@@ -2050,7 +2070,9 @@ plot_summary <- function(result, add_text=FALSE) {
     coefficients <- check_summary(result) 
     mult_df <- coefficients %>% filter(rownames(coefficients) != "(Intercept)")
     ggplot(mult_df, aes(x = rownames(mult_df), y = multiplier, ymin = multiplier_lb, ymax = multiplier_ub)) +
-        geom_pointrange() +
+        geom_pointrange(
+            color = ifelse(mult_df$significant == "Yes", "black", "firebrick")
+        ) +
         geom_hline(yintercept = 1, linetype = "dashed") +
         {if(add_text) geom_text(
             aes(label = round(multiplier, 2)), vjust = 2, 
@@ -2075,6 +2097,10 @@ We also observe that all the levels we kept are significant. The multipliers are
 We can conclude that the categorical variables were well-chosen in the EDA and have a significant impact in our model.
 The new model is better than the null model and needs no adaptation, so we can continue with the `rcat` model as our new baseline for further model development.
 
+```{r reassign_rcat}
+base_mod <- rcat
+```
+
 #### Binned Continuous Variables
 
 Next, we will add the binned continuous variables to our model to capture the potential non-linear effects of continuous predictors on the frequency of claims:
@@ -2098,11 +2124,195 @@ coefs_contb <- check_summary(rcontb)
 plot_summary(rcontb)
 ```
 
+There are two main takeaways from the analysis of this more complex model:
 
+1. With the addition of binned continuous variables, the `SEXfemale` and `FLEETY` variables are not significant anymore. It suggests that they may have been capturing some of the information that is now explained by the binned continuous variables.
+2. The binned continuous variables themselves are all significant at the 95% confidence level. The WoE-based binning and merging strategy we applied is therefore effective in capturing significant non-linear effects of continuous predictors on the frequency of claims.
+
+```{r non_significant}
+coefs_contb %>% filter(significant == "No") %>%
+    arrange(desc(p.value)) %>%
+    kable(booktabs = TRUE, caption = "Non-significant Coefficients")
+```
+
+We will start by removing the `FLEET` [^fleet_remove] variable from the model as it is less significant that the `SEX` variable.
+
+```{r prune_cont_mod_1}
+large_mod <- rcontb$fit
+fcontb_p1 <- gsub(" \\+ FLEET", "", fcontb)
+cat(sprintf("> Formula after removing FLEET: %s", fcontb_p1))
+
+rcontb_p1 <- create_wflow_freq_glm(train_data, fcontb_p1)
+perf_metrics_df <- append_performance_metrics(name = "Pruned-1 Continuous Binned", formula = fcontb_p1, result = rcontb_p1)
+test_p1 <- anova(large_mod, rcontb_p1$fit, test = "Chisq")
+cat(sprintf("Are we loosing significant explanatory power by removing FLEET? %s (p-value = %.4f)\n", ifelse(test_p1$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_p1$`Pr(>Chi)`[2]))
+coefs_contb_p1 <- check_summary(rcontb_p1)
+plot_summary(rcontb_p1)
+```
+
+Our conclusions hold and we will now proceed to remove the `SEX` variable from the model as it is the other non-significant variable.
+
+```{r prune_cont_mod_2}
+large_mod <- rcontb_p1$fit
+fcontb_p2 <- gsub(" \\+ SEX", "", fcontb_p1)
+cat(sprintf("> Formula after removing SEX: %s", fcontb_p2))
+
+rcontb_p2 <- create_wflow_freq_glm(train_data, fcontb_p2)
+perf_metrics_df <- append_performance_metrics(name = "Pruned-2 Continuous Binned", formula = fcontb_p2, result = rcontb_p2)
+test_p2 <- anova(large_mod, rcontb_p2$fit, test = "Chisq")
+cat(sprintf("Are we loosing significant explanatory power by removing SEX? %s (p-value = %.4f)\n", ifelse(test_p2$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_p2$`Pr(>Chi)`[2]))
+coefs_contb_p2 <- check_summary(rcontb_p2)
+plot_summary(rcontb_p2)
+base_mod <- rcontb_p2$fit
+```
+
+After pruning the non-significant variables `FLEET` and `SEX`, our final continuous binned model includes only the significant predictors. This model will serve as the base for the next enrichment steps in our modeling process.
+
+#### Enriched Features
+
+After including our continuous binned variables, we will now add the new geospatial and enriched features:
+
+- `REGION_merged`
+- `MUNICIPALITY_binned`
+- `POPULATION_binned`
+
+Because the Municipalities are so small, we will first focus on the two other variables.
+
+```{r enriched_features}
+f_enr2 <- paste0(fcontb_p2, " + REGION_merged + POPULATION_binned")
+cat(sprintf("> Formula after adding two enriched features: %s", f_enr2))
+r_enr2 <- create_wflow_freq_glm(train_data, f_enr2)
+perf_metrics_df <- append_performance_metrics(name = "Enriched Features", formula = f_enr2, result = r_enr2)
+test_enr2 <- anova(base_mod, r_enr2$fit, test = "Chisq")
+cat(sprintf("Are we gaining significant explanatory power by adding enriched features? %s (p-value = %.4f)\n", ifelse(test_enr2$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_enr2$`Pr(>Chi)`[2]))
+coefs_enr2 <- check_summary(r_enr2)
+plot_summary(r_enr2)
+```
+
+We notice that the `REGION_merged` and `POPULATION_binned` variables contribute significantly to the model, it was therefore worth including them as enriched features in our final model.
+
+- `REGION_mergedBrussels` is actually the second highest multiplier of claim frequency in the model: `r coefs_enr2["REGION_mergedBrussels", "multiplier"]` (95% CI: `r coefs_enr2["REGION_mergedBrussels", "multiplier_lb"]` - `r coefs_enr2["REGION_mergedBrussels", "multiplier_ub"]`)
+- `POPULATION_binned(1.34e+05,4.53e+05]`, so high population also stand out as third biggest multiplier of claim frequency in the model: `r coefs_enr2["POPULATION_binned(1.34e+05,4.53e+05]", "multiplier"]` (95% CI: `r coefs_enr2["POPULATION_binned(1.34e+05,4.53e+05]", "multiplier_lb"]` - `r coefs_enr2["POPULATION_binned(1.34e+05,4.53e+05]", "multiplier_ub"]`)
+
+Note that the largest multiplier of claim frequency is actually an experience-related variable, it should not be available for a-priori pricing. Therefore the enriched features we added are the most relevant for improving the a-priori model.
+Finally, let's have a quick look at the `MUNICIPALITY_binned` variable to see if it can add anything to the urban and population density we already considered.
+Note that we won't use our workflow because the bins are too small and we will run into issues with non-observed levels in the cross-validation folds.
+We'll make a single GLM fit to test our hypothesis.
+
+```{r municipality_binned}
+f_enr3 <- paste0(f_enr2, " + MUNICIPALITY_binned")
+cat(sprintf("> Formula after adding MUNICIPALITY_binned: %s", f_enr3))
+r_enr3 <- list()
+r_enr3$fit <- glm(as.formula(f_enr3), data = train_data, family = poisson())
+test_enr3 <- anova(r_enr2$fit, r_enr3$fit, test = "Chisq")
+cat(sprintf("Does MUNICIPALITY_binned add significant explanatory power? %s (p-value = %.4f)\n", ifelse(test_enr3$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_enr3$`Pr(>Chi)`[2]))
+coefs_enr3 <- check_summary(r_enr3)
+plot_summary(r_enr3)
+base_mod <- r_enr2$fit
+```
+
+Even if the more complex MUNICIPALITY_binned variable adds some explanatory power, we see that individual municipalities do not have a significant impact on claim frequency (multiplier close to 1).
+We will therefore not include `MUNICIPALITY_binned` in our final model.
+
+#### Interaction Effects
+
+To close this GLM estimation chapter for the claim frequency model, we will include the interaction effects we identified with the decision tree analysis.
+
+- `BM_binned` x `AGEPH_binned_merged`
+- `REGION_merged` x `POWER_binned_merged`
+- `BM_binned` x `REGION_merged`
+- `BM_01_FUEL_not_gasoline`
+- `BM_01_FUEL_gasoline`
+
+The interaction based on expert knowledge will also be considered:
+
+- `AGEPH_binned_merged` x `POWER_binned_merged`
+
+Because interactions will create very small cross sections, we'll skip cross validation and use GLM straightaway.
+
+```{r interactions}
+f_sp_int <- paste0(f_enr2, " + ", paste(interaction_features, collapse = " + "))
+cat(sprintf("> Formula after adding specific interaction: %s", f_sp_int))
+r_sp_int <- list()
+r_sp_int$fit <- glm(as.formula(f_sp_int), data = train_data, family = poisson())
+test_sp_int <- anova(base_mod, r_sp_int$fit, test = "Chisq")
+cat(sprintf("Are we gaining significant explanatory power by adding interactions? %s (p-value = %.4f)\n", ifelse(test_sp_int$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_sp_int$`Pr(>Chi)`[2]))
+coefs_sp_int <- check_summary(r_sp_int)
+plot_summary(r_sp_int)
+```
+
+Note that even if the interactions add some explanatory power, they make the model more complex, less stable, and harder to interpret.
+Besides, only the specific BM between 1 and 11 x Brussels Region has a significant effect on claim frequency.
+We will therefore not include the interaction terms in our final model.
+
+#### Summary of Performance Metrics and Final GLM Model
+
+We can close the GLM frequency model estimation here by looking at the evolution of our performance metrics across the different modeling stages:
+
+```{r performance_metrics}
+plot_leaderboard <- function(data, metric, title, digits = 2) {
+
+    plot_data <- data %>%
+        transmute(
+            Model = as.character(Model),
+            value = .data[[metric]]
+        ) %>%
+        arrange(desc(value)) %>%
+        mutate(
+            Model = factor(Model, levels = Model),
+            best = value == min(value, na.rm = TRUE)
+        )
+
+    ggplot(plot_data, aes(x = value, y = Model)) +
+        geom_segment(
+            aes(x = min(value), xend = value, yend = Model),
+            colour = "grey75"
+        ) +
+        geom_point(aes(colour = best), size = 3) +
+        geom_text(
+            aes(label = formatC(value, format = "f", digits = digits)),
+            hjust = -0.15,
+            size = 3.3
+        ) +
+        scale_colour_manual(
+            values = c("FALSE" = "grey", "TRUE" = "darkgreen"),
+            guide = "none"
+        ) +
+        scale_x_continuous(
+            expand = expansion(mult = c(0.08, 0.35))
+        ) +
+        labs(title = title, x = NULL, y = NULL) +
+        # rotate x-axis labels if needed
+        theme(
+            axis.text.x = element_text(angle = 45, hjust = 1)
+        ) +
+        theme_minimal(base_size = 11) +
+        theme(
+            panel.grid.major.y = element_blank(),
+            panel.grid.minor = element_blank(),
+            plot.title = element_text(face = "bold")
+        )
+}
+
+p1 <- plot_leaderboard(perf_metrics_df, "AIC", "AIC")
+p2 <- plot_leaderboard(perf_metrics_df, "BIC", "BIC")
+p3 <- plot_leaderboard(perf_metrics_df, "CV_Deviance", "CV deviance")
+p4 <- plot_leaderboard(
+    perf_metrics_df, "CV_LogLoss", "CV Poisson log loss", digits = 4
+)
+
+(p1 | p2) / (p3 | p4) +
+    plot_annotation(
+        title = "Model performance leaderboard",
+        subtitle = "Best model highlighted in green"
+)
+```
+
+Based on this leaderboard, we can confirm that our final model with categorical, significant binned continuous features and significant enriched features performs the best across all evaluated metrics.
+The other models have the same ranking across AIC, cross-validated deviance, and cross-validated Poisson log loss. The only difference we noticed is in the BIC metric that penalizes more model complexity.
+For the three models with continuous features, this penalization difference is sufficient to alter their ranking and favor the simpler models.
 
 ### GAM Models
-
-### Hurdle Models
 
 ### Final Frequency Model
 
@@ -2118,13 +2328,4 @@ plot_summary(rcontb)
 
 ## Final Premium Structure
 
-# Bonus Analysis
-
-## Alternative Tweedie Approach
-
-## Geospatial Insights
-
-
-
 # Conclusion
-na
