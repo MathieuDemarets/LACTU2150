@@ -1892,8 +1892,8 @@ The models will be gradually complexified by adding covariates. For each step, w
 
 For the scaled residual deviance, here are the maximum and minimum deviance values:
 
-- Null Deviance: $D_0 = 2 \times \left(\logLik(SaturatedModel) - \logLik(NullModel)\right)$
-- Residual Deviance: $D_m = 2 \times \left(\logLik(SaturatedModel) - \logLik(FittedModel)\right)$
+- Null Deviance: $D_0 = 2 \times \left( logLik(SaturatedModel) - logLik(NullModel) \right)$
+- Residual Deviance: $D_m = 2 \times \left( logLik(SaturatedModel) - logLik(FittedModel) \right)$
 - Scaled Residual Deviance: $D_s = \frac{D_m}{D_0}$
 
 ```{r full_model_deviance}
@@ -2282,15 +2282,13 @@ plot_leaderboard <- function(data, metric, title, digits = 2) {
             expand = expansion(mult = c(0.08, 0.35))
         ) +
         labs(title = title, x = NULL, y = NULL) +
-        # rotate x-axis labels if needed
-        theme(
-            axis.text.x = element_text(angle = 45, hjust = 1)
-        ) +
+        # remove x-axis labels
         theme_minimal(base_size = 11) +
         theme(
             panel.grid.major.y = element_blank(),
             panel.grid.minor = element_blank(),
-            plot.title = element_text(face = "bold")
+            plot.title = element_text(face = "bold"),
+            axis.text.x = element_blank()
         )
 }
 
@@ -2319,6 +2317,35 @@ For the three models with continuous features, this penalization difference is s
 ## Severity Modelling
 
 ### GLM Models
+
+We went through a lot of details in the data preparation and model selection process for the frequency component of our analysis.
+For the severity component, we will go through a similar process in much lesser depth to keep this report concise.
+We will nevertheless go through the following steps:
+
+- Filter out non-relevant observations for the severity analysis
+- Look at the distribution of the severity across individual features
+- Fit step-by-step GLM models to find our best model. We'll skip cross-validation for brevity.
+
+Watch out that we are not using the canonical link function for the Gamma distribution, which is the inverse link.
+This means that the sum of predicted values might not equal the total observed cost. In a real-world setting, we would need to account for this discrepancy when setting premiums.
+The reason why we will use the log link instead of the canonical inverse link is to ensure that our predicted values are always positive and to simplify the interpretation of the model coefficients (as multiplicative effects on the expected value of the response variable).
+
+#### Data Preparation For Severity Analysis
+
+```{r data-prep-severity}
+train_severity <- train_data[train_data$NCLAIMS > 0, ]
+avg_cost_int <- glm(AVG ~ 1, data = train_severity, family = Gamma(link = "log"))
+avg_cost_int_sum <- summary(avg_cost_int)
+beta <- avg_cost_int_sum$coefficients[1, 1]
+beta_sd <- avg_cost_int_sum$coefficients[1, 2]
+cat(sprintf("Estimated mean of average cost: %.2f (95%% CI: %.2f to %.2f)", exp(beta), exp(beta - 1.96 * beta_sd), exp(beta + 1.96 * beta_sd)))
+mean_avg <- mean(train_severity$AVG)
+sd_avg <- sd(train_severity$AVG)
+cat(sprintf("Observed mean of average cost: %.2f (sd-based 95%% CI: %.2f to %.2f)", mean_avg, mean_avg - 1.96 * sd_avg, mean_avg + 1.96 * sd_avg))
+```
+
+Why are t
+
 
 ### Final Severity Model
 
