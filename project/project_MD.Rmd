@@ -1,6 +1,6 @@
 ---
-title: "Insurance Claims Frequency and Severity"
-author: "McQueen Insurances"
+title: "Modeling Insurance Claims Frequency and Severity"
+author: "LACTU2150 - Statistical Analysis of Insurance Data"
 lang: en
 output:
     html_document:
@@ -72,21 +72,46 @@ library(poissonreg)
 
 # Executive Summary
 
-# Data Preparation
+<br>
 
-## Overview of the Dataset
-
-The first step of the data exploration process is to load the insurance claims of our Belgian Motor Third Party Liability (MTPL) dataset.
-We will start ensuring the uniqueness of keys. Straight after that, we will split the data between training and testing sets to make sure we keep a proper holdout for model evaluation.
-Then, we'll have a look at our target variables and the distribution of the exposure.
-Finally, we will have a quick look at the predictor variables we have before diving in the data transformation, exploration, and feature engineering.
+# Introduction
 
 <br>
 
-### Uniqueness of Keys
+## Background
 
-Each row in the dataset represents a unique insurance policy (`ID`). We can verify the uniqueness of rows by checking if the number of unique `ID`s matches the total number of rows.
-```{r uniqueness_of_rows, comment=NA}
+In Belgium, drivers are required to have Motor Third Party Liability (MTPL) insurance to ensure that damages caused to third parties will be covered financially. MTPL insurances are part of non-life insurance which covers risks to goods, property, and individuals that are not related to life insurance.
+These insurances are typically offered on a yearly basis. The policyholder pays a premium that covers the expected cost of claims during the policy period and the insurer assumes the risk of those claims.
+The advantage that insurances have over individuals is the concept of `mutualization`. When risks are pooled together:
+
+- The claims cost is better distributed across years and policyholders, turning a punctual high accident cost into a predictable premium [^indpd].
+- Average losses are mathematically more predictable due to the law of large numbers, reducing the impact of individual high-cost claims.
+
+The goal of mutualization is thus to support `chance solidarity` among policyholders, ensuring them against bad luck. However, not all policyholders have the same risk profile, and insurers will need to account for this `heterogeneity` when pricing premiums.
+If they don't, the policyholders with lower risk (technical gains) will end up subsidizing those with higher risk (technical losses), leading to an unfair distribution of premiums. They will tend to seek alternative insurance options better aligned with their risk profile.
+The higher-risk policyholders will on the contrary remain as a `community rating`(uniform premium) is more interesting for them compared to a risk-adjusted premium. The portfolio will thus tend to become increasingly composed of higher-risk individuals over time. 
+This is known as `adverse selection` and is the main risk for insurers if they fail to properly discriminate between different risk profiles when pricing premiums.
+
+The ideal for a commercial insurer [^stateInsurer] is to perfectly discriminate between different risk profiles to avoid `transfers` between risk classes. They can then provide `random solidarity` within each risk class without forcing `income or risk solidarity` across different risk classes.
+The commercial insurer will therefore start with a complex and detailed risk classification system to get as close as possible to the real risk of each policyholder. This is what we call `technical premium` modelling. It uncovers risk transfer between policyholders.
+It is however not possible nor desirable to use this complex model as a commercial model because the premium setting is not transparent enough and may not be acceptable to policyholders. Therefore, insurers often simplify the model to balance risk discrimination with transparency and marketability.
+We then talk about `commercial premium` modelling.
+
+The goal of this report is to analyze the Belgian Motor Third Party Liability (MTPL) insurance portfolio for 1997 to explore the risk factors and propose a suitable technical and commercial premium model.
+As we will explain in the "Approach" section of this Introduction chapter, we will study the frequency and severity of claims separately to better understand the impact of different risk factors on each component of the claims process.
+
+[^indpd]: This relies on the assumption that claims are independent across policyholders and time periods. This means that we do not consider catastrophic events or manufacturer defects that could lead to correlated claims.
+[^stateInsurer]: Community rating can be the best choice for a state insurer where the re-distribution mechanism is desirable and no alternative insurance options are available. Mutual insurances are a typical example of such arrangements.
+
+<br>
+
+## Portfolio Overview
+
+<br>
+
+### Records (Rows)
+
+```{r portfolio_overview}
 setwd(paste0(
     "C:/Users/MathieuDemarets/Documents/UCL Certificat/",
     "CodeRepositories/LACTU2150/project"
@@ -96,179 +121,273 @@ data <- mtpl_be
 
 n_unique_ids <- length(unique(mtpl_be$ID))
 n_rows <- nrow(mtpl_be)
-cat(sprintf(
-    "Number of unique IDs: %d\nNumber of rows: %d\nAre they equal? %s", 
-    n_unique_ids, n_rows, 
-    ifelse(n_unique_ids == n_rows, "Yes", "No")
-))
 
 index_training <- createDataPartition(mtpl_be$NCLAIMS, times = 1, p = 0.8, list = FALSE) # Note that we make a single partition, cv will be done with the training set during modelling
 data <- mtpl_be[index_training, ]
 holdout <- mtpl_be[-index_training, ]
-cat(sprintf(
-    "Training set rows (data): %d\nTesting set rows (holdout): %d\n",
-    nrow(data), nrow(holdout)
-))
 ```
+
+The first essential step is to get familiar with the MTPL insurance portfolio for 1997. The full portfolio consists of `r nrow(mtpl_be)` individual policies. 
+We ensured that each record represents a unique policy by verifying that the number of unique `ID`s matches the total number of rows (`r n_unique_ids` unique IDs = `r n_rows` rows).
+Before going any further, we will split the data into a training set (80% of the policies = `r nrow(data)`) and a holdout set (20% of the policies = `r nrow(holdout)`) for model evaluation.
+This split is made with regards to the number of claims (`NCLAIMS`) to ensure that both the training and holdout sets have a similar distribution of claims.
+Splitting the data is necessary for a proper independent evaluation of the models we will develop. The portfolio overview and data exploration is already part of the modelling process as it helps us understand the characteristics of the data and will guide us in selecting appropriate features and modeling techniques.
 
 <br>
 
-### Target Variables
+### Observations (Columns)
 
-For each policy, we have an exposure (`EXP`), which represents the fraction of the year that the policy was in force. The contract last a single year at most. Over that exposure time, we have the two target variables: 
+For each unique policies, we have a number of attributes that can be classified as:
 
-- **Frequency (`NCLAIMS`)**: The number of claims filed during the policy period.
-- **Severity (`AVG`)**: The average cost per claim during the policy period.
+- **Policyholder A-Priori Attributes**: age (`AGEPH`), gender (`SEX`), localisation (`LAT`, `LONG`, `PC`, and `TOWN`)
+- **Policyholder A-Posteriori Attributes**: bonus-malus score (`BM`) [^bm]
+- **Vehicle Attributes**: fuel type (`FUEL`), age (`AGEC`), power (`POWER`), usage (`USE`), fleet status (`FLEET`)
+- **Policy Attributes**: exposure (`EXP`) and MTPL coverage (`COVERAGE`)
+- **Target Variables**: frequency (`NCLAIMS`), severity (`AVG`), and total claim cost (`AMOUNT`)
 
-The total claim cost is derived from the frequency and severity:
+This classification helps us understand the data from a business perspective. From a modeling perspective, we will rather differentiate:
 
-- **Total Claim Cost (`NCLAIMS * AVG = AMOUNT`)**: The total cost of claims during the policy period.[^amount]
+- **Categorical Explanatory Variables**: `SEX`, `PC`, `TOWN`, `FUEL`, `USE`, `FLEET`, `COVERAGE` will be used as factors with eventual merged levels.
+- **Numerical Explanatory Variables**: `AGEPH`, `LAT`, `LONG`, `AGEC`, `POWER`, `BM` will be binned and treated as factors or will be used as continuous variables depending on the chosen model.
+- **Exposures**: `EXP` will be used as an offset to account for the varying lengths of policy coverage in the modeling process.
+- **Target Variables**: `NCLAIMS`, `AVG` will be used as the response variables in the modeling process, with `AMOUNT` being derived from them.
 
-[^amount]: For policies with no claims, `AMOUNT` is zero; `AVG` is undefined.
+[^bm]: A-priori attributes are what you know about the policyholder before engaging in the insurance contract. The bonus-malus score (`BM`) is an a-posteriori attribute as it reflects the policyholder's claim history and behavior. It is most often observed after the policy has been in force for some time and is therefore used for experience rating.
 
-```{r Exposure}
-qtable <- function(data, x, n_quant) {
-    data_not_na <- data[!is.na(data[[x]]), ]
-    if (sum(is.na(data[[x]])) > 0) warning(sprintf("Removing %d NA values from column %s", sum(is.na(data[[x]])), x))
-    # Get the n_quantiles of the column x
-    qx <- quantile(data_not_na[[x]], probs = seq(0, 1, by = 1 / n_quant))
-    quantiles <- data.frame(Quantile = names(qx), Value = as.numeric(qx))
-    quantiles$Value <- format(quantiles$Value, big.mark = ",", format = "f", digits = 2, scientific = FALSE)
-    rownames(quantiles) <- quantiles$Quantile
-    quantiles$Quantile <- NULL    
-    quantiles %>% t() %>% as.data.frame() %>% kable(
-    caption = sprintf("Quantiles of %s", x),
-    booktabs = FALSE
-    ) %>% kableExtra::kable_styling(full_width = FALSE, position = "left")
-}
+<br>
+
+#### All Variables
+
+```{r initial_data_overview}
+col_types <- sapply(data, class)
+categories <- list(
+    categorical = c("SEX", "PC", "TOWN", "FUEL", "USE", "FLEET", "COVERAGE"),
+    numerical = c("AGEPH", "LAT", "LONG", "AGEC", "POWER", "BM"),
+    exposure = c("EXP"),
+    target = c("NCLAIMS", "AVG", "AMOUNT")
+)
+
+all_vars <- data.frame(
+    Type = col_types,
+    Category = sapply(names(data), function(x) {
+        if (x %in% categories$categorical) {
+            "Categorical"
+        } else if (x %in% categories$numerical) {
+            "Numerical"
+        } else if (x %in% categories$exposure) {
+            "Exposure"
+        } else if (x %in% categories$target) {
+            "Target"
+        } else {
+            "Other"
+        }
+    }),
+    Center = sapply(data, function(x) {
+        if (is.numeric(x)) {
+            mean(x, na.rm = TRUE) %>% round(4)
+        } else {
+            counts <- sort(table(x), decreasing = TRUE)
+            names(counts)[1]
+        }
+    }),
+    Unique = sapply(data, function(x) length(unique(x))),
+    Missing = sapply(data, function(x) sum(is.na(x)))
+) %>% arrange(Category)
+
+all_vars %>% kable(
+    caption = paste0("Overview of all variables in the MTPL dataset (", nrow(data), " rows, ", ncol(data), " columns)"),
+    booktabs = TRUE
+)
 ```
 
+From this basic overview, we can note that:
 
-```{r claims_distribution}
-qtable(data, "NCLAIMS", 10)
+- There is no missing data except for `AVG`. As we will see later, this is expected as an average on zero-claim policies would be undefined.
+- `ID` is indeed a unique identifier as there are as many unique values (`r all_vars["ID","Unique"]`) as rows in the dataset.
+- Categorical variables are currently represented as character and integers, they will be later converted to factor variables.
+- `PC` and `TOWN` have too many levels (`r all_vars["PC","Unique"]` and `r all_vars["TOWN","Unique"]` respectively) and will have to be transformed to be usable. They also seem to indicate the same geographical information.
+- `EXP` has `r all_vars["EXP","Unique"]` unique values which indicates that claims happened over all possible days in a year.
+- The average claim `AMOUNT` (`r all_vars["AMOUNT","Center"]`) is not equal to the average `AVG` (`r all_vars["AVG","Center"]`). We will explore this further next because the Center values should be adjusted for the exposure `EXP`.
 
-p1 <- ggplot(data, aes(x = NCLAIMS)) +
+<br>
+
+#### Deep Dive into Exposure (`EXP`)
+
+The `exposure` is an important concept in frequency modelling. In latter sections, we will try to model the number of claims over a given period, this is the `claim frequency`. 
+The given period, which we call the exposure, is by default one year as non-life insurance policies are typically renewed annually. However, a policy can be stopped or canceled before the end of the year, resulting in an exposure less than one.
+It is important to keep in mind that exposure is the unit of risk and not the number of policies. Indeed, if we take the number of policies instead of the exposure, we will always underestimate the true claim frequency (as the exposure is between 0 and 1).
+
+If we denote the number of claims by `NCLAIMS`, the exposure by `EXP`, then the claim frequency `$\hat{\lambda}$` (the expected number of claims per unit of exposure) is given by:
+
+$$
+\hat{\lambda} = \frac{\sum_{i=1}^{n} NCLAIMS_i}{\sum_{i=1}^{n} EXP_i} \leq \frac{\sum_{i=1}^{n} NCLAIMS_i}{n}
+$$
+
+In the dataset, about `r 1-round(sum(data$EXP == 1) / nrow(data), 2)` of the policies have an exposure less than 1, it is therefore important to account for the actual exposure when estimating the claim frequency.
+We also saw in the description of all variables that the average exposure is `r all_vars["EXP","Center"]`, which means that the actual claim frequency will be underestimated by this factor if we were to ignore the exposure and take the naive mean of `NCLAIMS`.
+
+```{r exp_mean_claim_frequency}
+correct_lambda <- sum(data$NCLAIMS) / sum(data$EXP)
+naive_lambda <- mean(data$NCLAIMS)
+se_mean <- sqrt(correct_lambda / sum(data$EXP))
+ic_99 <- correct_lambda + c(-1, 1) * qnorm(0.995) * se_mean
+
+cat(sprintf(
+    "Correct mean claim frequency is %.3f%% (99%% CI: [%.3f%%, %.3f%%]) and not the naive mean %.3f%%",
+    correct_lambda * 100,
+    ic_99[1] * 100,
+    ic_99[2] * 100,
+    naive_lambda * 100
+))
+```
+
+We confirm numerically that the naive mean of `NCLAIMS` underestimates the true claim frequency as it falls short of the 99% confidence interval[^ic] for the correct mean claim frequency. It is therefore important to account for the exposure through the offset[^offset] in the frequency modelling.
+
+[^offset]: In frequency modelling, the exposure is typically included as an offset in the model to adjust for the varying lengths of policy coverage. This ensures that the estimated claim frequency accurately reflects the risk per unit of exposure rather than per policy.
+[^ic]: If we assume a poisson distribution for the number of claims, we'll show in the data exploration section that the standard error of the claim frequency can be estimated as $ \sqrt{\frac{\hat{\lambda}}{\sum_{i=1}^{n} EXP_i}} $.
+
+<br>
+
+#### Deep Dive into Target Variables (`NCLAIMS`, `AVG`, `AMOUNT` )
+
+The expected cost of claims can be decomposed into the expected frequency of claims and the expected severity of claims. The expected total claim cost `$\pi$` can be expressed in terms of the expected frequency `$\lambda$` and the expected severity `$\mu$` as:
+
+$$
+\pi(x) = \lambda(x) \cdot \mu(x)
+$$
+
+This split is useful to isolate the effects of explanatory variables on the likehood of claims occurring (`\lambda(x)`) from the impact of that claim occurring (`\mu(x)`)[^credit_parallel]. 
+The mitigation strategies are also different depending on whether we aim to reduce the frequency of claims (prevention and underwriting) or the severity of claims (reinsurance and deductibles).
+
+[^credit_parallel]: Similar decomposition are done in business with `Impact-Likelihood` matrices or in credit risk modelling with `Probability of Default` and `Loss Given Default`.
+
+For our training dataset[^training], the empirical expected total claim cost can be decomposed into the product of the empirical expected claim frequency and the empirical expected claim severity:
+
+$$
+\frac{\sum_{i=1}^{n} AMOUNT_i}{\sum_{i=1}^{n} EXP_i} = \frac{\sum_{i=1}^{n} NCLAIMS_i}{\sum_{i=1}^{n} EXP_i} \cdot \frac{\sum_{i=1}^{n} AMOUNT_i}{\sum_{i=1}^{n} NCLAIMS_i}
+\text{where } \frac{\sum_{i=1}^{n} AMOUNT_i}{\sum_{i=1}^{n} NCLAIMS_i} = AVG_i
+$$
+
+```{r global_portfolio}
+sum_exp <- sum(data$EXP)
+sum_nclaims <- sum(data$NCLAIMS)
+sum_amount <- sum(data$AMOUNT)
+
+cat(sprintf("Expected Total Claim Cost: %.2f = %.2f * %.2f", sum_amount / sum_exp, sum_nclaims / sum_exp, sum_amount / sum_nclaims))
+cat(sprintf("With sum_amount = %.2f, sum_nclaims = %.2f, sum_exp = %.2f", sum_amount, sum_nclaims, sum_exp))
+```
+
+[^training]: Remember that the global portfolio was split to keep a holdout dataset of 20% for validation.
+
+This is not the full picture as an aggregated view hides the heterogeneity within the portfolio. Looking at the distribution of claims for frequency and the distribution of average claim cost for severity provides a view of this heterogeneity that we will try to capture in the rest of the report.
+
+```{r heterogeneity}
+p_n_claims <- ggplot(data, aes(x = NCLAIMS, fill = NCLAIMS == 0)) +
     geom_bar() +
+    scale_fill_manual(values = c("TRUE" = "lightgrey", "FALSE" = "steelblue")) +
     labs(
-        title = "NCLAIMS Distribution",
-        x = "Number of Claims",
-        y = sprintf("Count (All: %d)", nrow(data))
+        title = "Frequency - Number of Claims",
+        y = sprintf("Count (All: %d)", nrow(data)),
+        x = "Number of Claims"
     ) +
     theme_minimal()
 
-qtable(data, "AVG", 10)
+avg_plot <- data %>% filter(!is.na(AVG))
 
-filtered_AVG <- data %>% filter(!is.na(AVG))
-
-p2 <- ggplot(filtered_AVG, aes(x = log(AVG))) +
+p_avg <- ggplot(avg_plot, aes(x = log(AVG), fill = NCLAIMS == 0)) +
     geom_histogram(bins = 30) +
+    scale_fill_manual(values = c("TRUE" = "lightgrey", "FALSE" = "steelblue")) +
     labs(
-        title = "AVG Distribution",
+        title = "Severity - Average Claim Cost",
         x = "Log of Average Claim Cost",
-        y = sprintf("Count (All: %d)", nrow(filtered_AVG))
+        y = sprintf("Count (All: %d)", nrow(avg_plot))
     ) +
+    geom_vline(aes(xintercept = 5), linetype = "dashed", color = "orange") +
+    geom_vline(aes(xintercept = 7.5), linetype = "dashed", color = "red") +
+    geom_vline(aes(xintercept = 10), linetype = "dashed", color = "purple") +
     theme_minimal()
 
-qtable(data, "AMOUNT", 10)
-
-filtered_AMOUNT <- data %>% filter(!is.na(AMOUNT))
-p3 <- ggplot(filtered_AMOUNT, aes(x = AMOUNT)) +
-    geom_histogram(bins = 30) +
-    labs(
-        title = "AMOUNT Distribution",
-        x = "Total Claim Amount",
-        y = sprintf("Count (All: %d)", nrow(filtered_AMOUNT))
-    ) +
-    theme_minimal()
-
-
-(p1 | p3 )/ p2
+p_n_claims | p_avg
 ```
 
-For both the frequency and severity of claims, we observe a large distribution mass around zero. This is quite typical in insurance data, where many policies have no claims or very low average claim costs. We also note that `r sum(is.na(data$AVG))` policies have missing average claim costs.
-This is simply because no claims were reported for these policies (`r sum(data$NCLAIMS == 0)` policies with no claims). The claim amount is by nature zero in this case, and the average ($\frac{AMOUNT}{NCLAIMS}$) is undefined and not informative. When we will tackle the modeling of claim severity, we will therefore focus only on policies with at least one claim.
-To handle unbalanced data in the frequency modelling, various techniques are available such as:
+For the number of claims, we observe a clear imbalance in the data with `r round(100 * sum(data$NCLAIMS == 0)/nrow(data), 2)`% of the policies having no claims.
+This is quite typical in insurance data, where many policies have no claims or very low average claim costs. We could tackle this data imbalance with dedicated techniques such as:
 
 - Synthetic oversampling techniques (e.g., SMOTE) create synthetic samples for the minority class to balance the dataset.
 - Hurdle models can be employed to separately model the zero and non-zero counts, effectively handling the excess zeros in the data and focusing on the non-zero records in the second part of the model.
 
-These are outside the scope of this analysis, it is nevertheless important to note that this unbalance will limit the frequency modelling performance and that these techniques could be explored in the future.
+These techniques will however break the adequation between the observed frequency and the modeled frequency which is an important benefit of the modeling approach that we will present in the next section.
+We will therefore not apply these techniques in this analysis.
 
-We can also note that the distribution of average claim is more interesting to look at. Indeed, we exclude policies with no claims, as their average claim is undefined. Then, we can take the logarithm of the average claim to better visualize the scale of cost instead of the absolute values.
-The quantiles indeed show us a very skewed distribution, with most average claims being relatively low but a few policies having very high average claims. We can see two peaks in the log-transformed average claim distribution which indicates the presence of different kind of claims:
+For policies with claims, we look at the log of the average claim cost to better understand the distribution of claim severity in terms of magnitude. We observe two peaks and a long right tail. This shows that the average claim cost we computed above actually hides very different types of claims:
 
 - First peak corresponds to small dents and repairs: the log around 5 represents claims of approximately `r sprintf("%.0f euros", exp(5))`
 - Second peak corresponds to more significant repairs: the log around 7.5 represents claims of approximately `r sprintf("%.0f euros", exp(7.5))`
 - Right tail corresponds to way bigger damages: the log around 10 represents claims of approximately `r sprintf("%.0f euros", exp(10))`
 
-Even if they are not so frequent, the larger claims in the right tail can have a significant impact on the company profitability. A future report could use `Extreme Value Theory` to better model and understand these rare but impactful claims.
-
-```{r exposure_distribution}
-qtable(data, "EXP", 10)
-```
-
-Regarding the exposure, we see that a large majority of the policies have an exposure close to 1, indicating that most policies are active for nearly the entire year.
-About `r 1-round(sum(data$EXP == 1) / nrow(data), 2)` of the policies have an exposure less than 1. This does not suggest that an analysis per exposure level is necessary.
-
-Exposure should still be considered to correctly estimate the claim frequency as counting full exposure would underestimate the risk.
-The correct way to compute the mean claim frequency is $$\frac{\sum{NCLAIMS}}{\sum{EXP}}, \text{ where } EXP \in [0, 1]$$ which will therefore be higher than the simple mean $$\frac{\sum{NCLAIMS}}{nrow(data) = \sum{1}}$$
-```{r mean_frequency}
-mean_claim_frequency <- sum(data$NCLAIMS) / sum(data$EXP)
-se_mean <- sqrt(mean_claim_frequency / sum(data$EXP))
-ic_99 <- mean_claim_frequency + c(-1, 1) * 2.576 * se_mean
-wrong_mean <- mean(data$NCLAIMS)
-cat(sprintf(
-    "Correct mean claim frequency: %.3f%% (99%% CI: [%.3f%%, %.3f%%])\nNaive mean: %.3f%%",
-    mean_claim_frequency * 100,
-    ic_99[1] * 100,
-    ic_99[2] * 100,
-    wrong_mean * 100
-))
-```
-
-This confirms that the naive mean of `NCLAIMS` falls short of the 99% confidence interval for the correct mean claim frequency. It is therefore crucial to account for the exposure through the offset[^offset] in the frequency modelling.
-
-[^offset]: In frequency modelling, the exposure is typically included as an offset in the model to adjust for the varying lengths of policy coverage. This ensures that the estimated claim frequency accurately reflects the risk per unit of exposure rather than per policy.
+Even if they are not so frequent, the larger claims in the right tail can have a significant impact on the company profitability. A future report could use `Extreme Value Theory` to better model and understand these rare but impactful claims. We will not apply this technique in the current analysis.
 
 <br>
 
-### All Variables
+## Approach
 
-```{r initial_data_overview}
-col_types <- sapply(data, class)
+The goal of this report is to estimate the expected claim cost for different policies, taking into account both the frequency and severity of claims.
+Here is an overview of the main steps we will follow to achieve this goal:
 
-knitr::kable(
-    data.frame(
-        Type = col_types,
-        Center = sapply(data, function(x) {
-            if (is.numeric(x)) {
-                mean(x, na.rm = TRUE) %>% round(4)
-            } else {
-                counts <- sort(table(x), decreasing = TRUE)
-                names(counts)[1]
-            }
-        }),
-        Missing = sapply(data, function(x) sum(is.na(x)))
-    ),
-    caption = "Overview of variable in the insurance claims dataset",
-    booktabs = TRUE
-) %>% kableExtra::kable_styling(full_width = TRUE, position = "left")
-```
+1. **Data Preparation**: The goal of the data preparation is to go towards the modeling stage with clean, well-structured, and informative features only.
+    - *Data Transformation*
+        - Transform categorical variables to factors and set appropriate reference levels
+        - Bin numerical variables using a weight of evidence (WoE) approach to create meaningful intervals for modeling
+    - *Data Exploration*
+        - Visualize graphically the claim frequency and severity distributions across variables
+        - Statistically verify if variables are significant and whether merging levels is appropriate
+    - *Feature Engineering*
+        - Add geospatial features based on the location to capture urban v. rural and population density effects
+        - Assess polynomial and orthogonal polynomial transformations to provide a baseline for capturing non-linear effects in numerical variables
+        - Uncover interactions between variables based on a decision tree model
+2. **Frequency Modeling**: The frequency modeling will compare increasingly complex models and compare their performance. For each layer of complexity, we will fit the model, prune non-significant variables, and test that the model captures more information than the previous layer with an anova test.
+    - *Validation Framework*
+        - Define data preparation pipeline to mirror EDA steps and ensure consistency between exploration and modeling
+        - Set performance evaluation metrics and cross-validation strategy
+    - *Generalized Linear Models (GLM) - Poisson(log)*
+        - Categorical variables only (fit, prune, and test)
+        - Binned numerical variables added (fit, prune, and test)
+        - Enriched features added (fit, prune, and test)
+        - Interactions added (fit, prune, and test)
+        - Summarize the cross-validated prediction error, deviance, and log loss to select the best model (one per layer of complexity)
+    - *Generalized Additive Models (GAM) - Poisson(log)*
+        - Show the GAM logic through manual backfitting for latitude and longitude variables
+        - Take the model from the categorical variables only layer as the baseline, add enriched features and continuous variables and fit, prune, and test the model
+        - Vizualise the smoothed functions for continuous variables and compare them to the binned numerical variable effects and polynomial transformations
+    - *Final Frequency Model*
+        - Evaluate the various options based on the holdout to confirm the final technical model choice.
+        - Merge levels with similar effects to simplify the model and improve interpretability
+        - Remove sensitive variables to comply with regulatory requirements and ensure fairness
+        - Interpret the final commercial model coefficients
+3. **Severity Modeling**
+    - *Validation Framework*
+        - Adapt the metrics to the gamma family, considering the log link and the specific characteristics of the severity modeling
+    - *Generalized Linear Models (GLM) - Gamma(log)[^logling]*:
+        - Show that modeling the average claim cost with the number of claims as weights is equivalent to modeling the total claim cost with the log number of claims as an offset.
+        - Apply the same approach as for the frequency modeling, with cross-validation and performance evaluation metrics for different layers of complexity
+    - *Final Severity Model*: the same logic of confirming, simplifying, and interpreting the technical model applies here as well
+4. **Premium Modeling**
+    - *Combined Model*
+        - Combine the frequency and severity models to obtain the overall premium prediction
+        - Rescale the severity intercept to ensure observation-prediction alignment
+    - *Interpretation*
+        - Interpret the combined coefficients
+        - Show the resulting premium predictions for various policyholder classes
 
-From this basic overview, we can confirm a few key points:
+Note that the report goes into technical details. Depending on the reader's familiarity with statistical modeling and interest, the following sections can be considered as bonus explorations:
 
-- `ID`: all rows indeed have an identifier (no missing values) and we saw before that it is unique for each row.
-- `NCLAIMS`: the mean value of `r sprintf("%.3f%%", wrong_mean * 100)` is **NOT** the correct mesure of risk over the exposition and should be adjusted by the exposure `EXP` to get `r sprintf("%.3f%%", mean_claim_frequency * 100)`.
-- `AMOUNT`: the average loss amount of `r sprintf("%.3f euros", mean(data$AMOUNT, na.rm = TRUE))` hides very different realities between no-claim, low-ticket, medium, and high-ticket claims as we established earlier.
-- `AVG`: the average claim cost is higher than the average loss amount which seems counterintuitive at first, but it reflects the fact that `AVG` is calculated only for policies with claims, whereas `AMOUNT` includes all policies, including those with no claims as we see with the number of missing values in `NCLAIMS` corresponding to policies with no claims as discussed earlier.
+- WoE (Weight of Evidence) Binning for numerical variables: a simpler quantile-based approach would have been sufficient for the scope of this assignment
+- Feature engineering: creating new variables was not directly in the scope of this assignment
+- Commercial model simplification: merging similar levels and removing sensitive variables was applied to improve interpretability
 
-We can also notice that some columns have been asigned the wrong type:
+[^logling]: The careful reader will notice that we will use the log link instead of the canonical link for the Gamma distribution. This choice is to ensure that we keep a multiplicative structure. It breaks the total marginality property of the canonical link but provides more interpretable results in the context of insurance claim modeling.
 
-- **COVERAGE, FUEL, USE, FLEET, SEX, and TOWN** should be set as unordered factor variables instead of character variables.
-- **PC** should be converted from integer to an unordered factor variable.
-
-This leads us to our next section on data transformation.
-
+# Data Preparation
 
 ## Data Transformation
 
@@ -369,7 +488,6 @@ qbinning <- function(data, x, y, max_bins = 10) {
         temp_binning <- unique(
             quantile(raw_data[[x]], probs = seq(0, 1, length.out = temp_n + 1), na.rm = TRUE)
         )
-        # check if there is at least one claim in each bin
         bin_claims <- tapply(
             raw_data[[y]],
             cut(raw_data[[x]], temp_binning, include.lowest = TRUE),
@@ -500,9 +618,7 @@ The example for `AGEPH` already shows very interesting patterns for our baseline
 Let's confirm visuallythe relationship between age and number of claims by examining the boxplots and claim frequency by age bin.
 
 ```{r age_claims_correlation}
-# boxplot of age for each number of claims
 boxplot(AGEPH ~ NCLAIMS, data = data, xlab = "NCLAIMS", ylab = "AGEPH", main = "Boxplot of AGEPH by NCLAIMS")
-# claim frequency in our example bins, group by bin
 age_quantiles <- cut(data$AGEPH, breaks = bins_ageph, include.lowest = TRUE)
 gpd_data <- data %>% 
     mutate(age_bin = age_quantiles) %>% 
@@ -517,7 +633,7 @@ gpd_data <- data %>%
         lambda_99_lower = lambda - 2.58 * sd_lambda,
         lambda_99_upper = lambda + 2.58 * sd_lambda
     )
-# Plot the claim frequency (lambda) with filled error bars 95 and 99 percent confidence intervals
+
 p2 <- ggplot(gpd_data, aes(x = age_bin, group = 1)) +
     geom_ribbon(
         aes(ymin = lambda_99_lower, ymax = lambda_99_upper),
@@ -657,11 +773,10 @@ Based on the comparison above, the optimal amount of bins seems to be 7 because:
 The complex pattern we noticed in our initial `r length(bins_ageph) - 1` bins seems to be well captured with 7 bins only.
 
 ```{r binned_numerical}
-# We add the ordered factor variable for the binned AGEPH
 data$AGEPH_binned <- cut(
     data$AGEPH, 
     breaks = rebuild_bins(result_ageph, 7), include.lowest = TRUE, ordered_result = TRUE)
-# Check the distribution of the binned variable
+
 n_bins_named_list[["AGEPH"]] <- 7
 summary(data$AGEPH_binned) %>%
     kable(
@@ -805,6 +920,7 @@ $$ \hat{\lambda} \sim \text{Normal}\left(\lambda, \frac{\lambda}{\sum_i d_i}\rig
 Based on this mathematical understanding, we can build a main plot which shows exposures, claims, and claim frequencies with their confidence intervals (95 and 99%) across different bins for each variable.
 
 ```{r main_plot}
+mean_claim_frequency <- sum(data$NCLAIMS) / sum(data$EXP)
 plot_claim_freq <- function(data, variable) {
     df_grouped <- data %>%
         mutate(bin = data[[variable]]) %>%
@@ -956,7 +1072,7 @@ It is not clear whether the last 3 bins should be merged or kept separate, as th
 We already addressed the statistical significance by visually checking the confidence intervals around the claim frequencies.
 In this statistical data exploration, we will add two anova layers onto that visual inspection: 
 
-#### Global Anova Test:
+#### Global ANOVA Tests
 
 We will compare the deviance of the model with the variable as single predictor to the null model with only the offset term. This will allow us to test if the variable significantly improves the model fit:
 
@@ -986,7 +1102,7 @@ for (var in c("COVERAGE_BIN", "FUEL", "USE", "FLEET", "SEX", "BM_binned", "AGEPH
 
 With this first global anova test, we confirm our graphical approach, all variables should be kept except for `USE`.
 
-#### Merged bins
+#### Merging Levels with Similar Effects
 
 Let's take the example of `COVERAGE` where we decided to merge the two omnium levels. 
 Can we justify this statistically with the ANOVA test instead of simply with the confidence intervals?
@@ -1452,7 +1568,6 @@ polynomial_features <- lapply(numerical_continuous, function(var) {
     poly(data_enriched[[var]], degree = 3, raw = TRUE)
 })
 names(polynomial_features) <- numerical_continuous
-# Initialize data frame with proper structure
 correlation_matrix <- data.frame(
     matrix(NA, nrow = length(numerical_continuous), ncol = 6)
 )
@@ -1461,7 +1576,6 @@ colnames(correlation_matrix) <- c(
     "Claims Poly1", "Claims Poly2", "Claims Poly3",
     "Avg Poly1", "Avg Poly2", "Avg Poly3")
 
-# Fill the matrix
 for (var in numerical_continuous) {
     poly_values <- polynomial_features[[var]]
     for (j in 1:3) {
@@ -1508,7 +1622,6 @@ colnames(orth_correlation_matrix) <- c(
     "OrthClaims Poly1", "OrthClaims Poly2", "OrthClaims Poly3",
     "OrthAvg Poly1", "OrthAvg Poly2", "OrthAvg Poly3")
 
-# Fill the matrix
 for (var in numerical_continuous) {
     poly_values <- orthogonal_polynomial_features[[var]]
     for (j in 1:3) {
@@ -1598,7 +1711,7 @@ data_enriched <- data_enriched %>%
 - `REGION_merged` x `POWER_binned_merged`
 - `BM_binned` x `REGION_merged`
 
-# Modelling
+# Frequency Modeling
 
 Now that we have explored, transformed, and enriched our data. We are ready to proceed with the modelling phase. We have a rich set of features to gradually incorporate into our models to improve predictive performance.
 We will also clean all intermediary objects that won't be used for modelling.
@@ -1671,8 +1784,7 @@ Remember that at the start of the Data Preparation chapter, we kept a holdout se
 We will now create a workflow including:
 
 - **Data Preparation**: enriching the dataset and transforming features as described in the previous sections.
-- **Model Training**: fitting the selected models to the prepared training data with a 5-fold cross-validation.
-- **Model Validation**: evaluating the performance of the trained models on the holdout set.
+- **Model Selection**: fitting and evaluating the selected models to the prepared training data with a 5-fold cross-validation.
 
 ### Data Preparation Workflow
 
@@ -1829,7 +1941,7 @@ for (col in c(original_categorical_features, binned_continuous_features, enriche
 cat(sprintf("All columns in test_data match the enriched data.\n(%s)", paste(c(original_categorical_features, binned_continuous_features, enriched_features), collapse = ", ")))
 ```
 
-### Cross-Validation
+### Cross-Validation Strategy
 
 To better understand cross-validation, let's illustrate it with a simple manual example.
 We create 5 data sets (folds) for cross-validation. Each fold will be used once as a validation set while the remaining folds form the training set.
@@ -1866,7 +1978,7 @@ cat(sprintf("Cross-validated beta0: min = %s, mean = %s, max = %s\n", min(unlist
 This illustrates how cross-validation enables enables to check the robustness and variability of the model's performance and parameter estimates across different subsets of the data.
 Comparing the cross-validated mean log loss, AIC or BIC across various models will yield a more robust choice for model selection. Now that the intuition is set, we can create our workflow including cross-validation.
 
-### Performance Metrics
+### Performance Metrics and Nested Model Comparison
 
 To compare the performance of different models, we can consider the following cross-validated metrics:
 
@@ -1926,11 +2038,7 @@ The anova test will be comparing the deviance of the nested models to evaluate w
 anova(m_null, m_ex, test = "Chisq")
 ```
 
-## Frequency Modelling
-
-Based on all the notions explained in the Validation Framework: data preparation, cross-validation, and performance metrics, we will now create workflows for frequency modelling.
-
-### GLM Models
+## Generalized Linear Models (GLM)
 
 ```{r glm_workflow}
 
@@ -1998,7 +2106,7 @@ We created a workflow to:
 
 This workflow will be used for all models in the frequency analysis, ensuring consistency in model fitting, cross-validation, and performance evaluation.
 
-#### Categorical Variables Only
+### Categorical Variables Only
 
 Let us start with adding the categorical variables only to our frequency model:
 
@@ -2101,7 +2209,7 @@ The new model is better than the null model and needs no adaptation, so we can c
 base_mod <- rcat
 ```
 
-#### Binned Continuous Variables
+### Binned Continuous Variables
 
 Next, we will add the binned continuous variables to our model to capture the potential non-linear effects of continuous predictors on the frequency of claims:
 
@@ -2168,7 +2276,7 @@ base_mod <- rcontb_p2$fit
 
 After pruning the non-significant variables `FLEET` and `SEX`, our final continuous binned model includes only the significant predictors. This model will serve as the base for the next enrichment steps in our modeling process.
 
-#### Enriched Features
+### Enriched Features
 
 After including our continuous binned variables, we will now add the new geospatial and enriched features:
 
@@ -2214,7 +2322,7 @@ base_mod <- r_enr2$fit
 Even if the more complex MUNICIPALITY_binned variable adds some explanatory power, we see that individual municipalities do not have a significant impact on claim frequency (multiplier close to 1).
 We will therefore not include `MUNICIPALITY_binned` in our final model.
 
-#### Interaction Effects
+### Interaction Effects
 
 To close this GLM estimation chapter for the claim frequency model, we will include the interaction effects we identified with the decision tree analysis.
 
@@ -2245,7 +2353,7 @@ Note that even if the interactions add some explanatory power, they make the mod
 Besides, only the specific BM between 1 and 11 x Brussels Region has a significant effect on claim frequency.
 We will therefore not include the interaction terms in our final model.
 
-#### Summary of Performance Metrics and Final GLM Model
+### Summary of Performance Metrics and Final GLM Model
 
 We can close the GLM frequency model estimation here by looking at the evolution of our performance metrics across the different modeling stages:
 
@@ -2310,13 +2418,45 @@ Based on this leaderboard, we can confirm that our final model with categorical,
 The other models have the same ranking across AIC, cross-validated deviance, and cross-validated Poisson log loss. The only difference we noticed is in the BIC metric that penalizes more model complexity.
 For the three models with continuous features, this penalization difference is sufficient to alter their ranking and favor the simpler models.
 
-### GAM Models
+<br>
 
-### Final Frequency Model
+## Generalized Additive Models (GAM)
 
-## Severity Modelling
+<br>
 
-### GLM Models
+### Manual Backfitting for Latitude and Longitude
+
+Illustrate the GAM logic by alternately updating the latitude and longitude effects while holding the other model components fixed.
+
+<br>
+
+### Adding Enriched Features and Continuous Variables
+
+Use the categorical-only frequency GLM as the baseline, then add enriched features and smooth terms for continuous variables.
+
+### Model Fitting, Pruning, and Comparison
+
+Fit the candidate GAMs, assess the contribution of their terms, and compare their performance using the frequency validation framework.
+
+<br>
+
+### Smooth Effects Compared with Bins and Polynomial Transformations
+
+Visualize the smooth functions and compare their shapes with the binned numerical effects and the raw and orthogonal polynomial explorations.
+
+## Final Frequency Model
+
+### Holdout Evaluation and Technical Model Selection
+
+Compare the shortlisted GLM and GAM predictions on the holdout set to assess the final technical model choice.
+
+### Merging Levels with Similar Effects
+
+### Removing Sensitive Variables
+
+### Commercial Model Coefficient Interpretation
+
+# Severity Modeling
 
 We went through a lot of details in the data preparation and model selection process for the frequency component of our analysis.
 For the severity component, we will go through a similar process in much lesser depth to keep this report concise.
@@ -2324,13 +2464,18 @@ We will nevertheless go through the following steps:
 
 - Filter out non-relevant observations for the severity analysis
 - Look at the distribution of the severity across individual features
-- Fit step-by-step GLM models to find our best model. We'll skip cross-validation for brevity.
+- Adapt the validation metrics to the Gamma family with a log link
+- Compare claim-count weighting of average costs with a claim-count offset for total costs
+- Fit, prune, and compare successive GLM layers using cross-validation
+- Evaluate the shortlisted models on the holdout set, then simplify and interpret the final model
 
 Watch out that we are not using the canonical link function for the Gamma distribution, which is the inverse link.
 This means that the sum of predicted values might not equal the total observed cost. In a real-world setting, we would need to account for this discrepancy when setting premiums.
 The reason why we will use the log link instead of the canonical inverse link is to ensure that our predicted values are always positive and to simplify the interpretation of the model coefficients (as multiplicative effects on the expected value of the response variable).
 
-#### Data Preparation For Severity Analysis
+## Validation Framework
+
+### Data Preparation for Severity Analysis
 
 ```{r data-prep-severity}
 train_severity <- train_data[train_data$NCLAIMS > 0, ]
@@ -2344,15 +2489,58 @@ sd_avg <- sd(train_severity$AVG)
 cat(sprintf("Observed mean of average cost: %.2f (sd-based 95%% CI: %.2f to %.2f)", mean_avg, mean_avg - 1.96 * sd_avg, mean_avg + 1.96 * sd_avg))
 ```
 
-Why are t
+### Gamma Performance Metrics and Cross-Validation
 
+Adapt the frequency validation framework to positive claim costs, using Gamma deviance and negative log-likelihood with a consistent treatment of claim-count weights. Apply the same preparation pipeline within each cross-validation fold and reserve the holdout set for final evaluation.
 
-### Final Severity Model
+## Generalized Linear Models (GLM) - Gamma(log)
 
-# Global Overview
+### Average Claim Cost Weights and Total Claim Cost Offset
 
-## Importance of Features
+Compare modeling average claim cost with the number of claims as weights against modeling total claim cost with the log number of claims as an offset. Check the corresponding Gamma dispersion and likelihood specifications when assessing their equivalence.
 
-## Final Premium Structure
+### Categorical Variables Only
+
+### Adding Binned Numerical Variables
+
+### Adding Enriched Features
+
+### Adding Interactions
+
+### Cross-Validated Performance Summary and GLM Model Selection
+
+Compare the fitted and pruned models from each complexity layer using the severity validation metrics.
+
+## Final Severity Model
+
+### Holdout Evaluation and Technical Model Selection
+
+### Merging Levels with Similar Effects
+
+### Removing Sensitive Variables
+
+### Commercial Model Coefficient Interpretation
+
+# Premium Modeling
+
+## Combined Model
+
+### Combining Frequency and Severity Predictions
+
+Combine the expected claim frequency and expected claim severity to obtain the expected claim cost for each policy, accounting for the exposure basis of the frequency predictions.
+
+### Severity Intercept Rescaling for Observation-Prediction Alignment
+
+Assess aggregate observed and predicted claim costs, then rescale the severity intercept to align their totals on the calibration data. Keep the holdout set separate from this calibration.
+
+## Interpretation
+
+### Combined Coefficients and Feature Effects
+
+Interpret how the frequency and severity effects combine in the premium structure, distinguishing coefficient-based multiplicative effects from any retained GAM smooth effects.
+
+### Premium Predictions by Policyholder Class
+
+Present the resulting premium predictions for representative policyholder classes.
 
 # Conclusion
