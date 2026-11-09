@@ -49,6 +49,7 @@ if (!require("rsample")) install.packages("rsample")
 if (!require("parsnip")) install.packages("parsnip")
 if (!require("workflows")) install.packages("workflows")
 if (!require("poissonreg")) install.packages("poissonreg")
+if (!require("rlang")) install.packages("rlang")
 
 library(dplyr)
 library(forcats)
@@ -67,6 +68,7 @@ library(tidymodels)
 library(parsnip)
 library(workflows)
 library(poissonreg)
+library(rlang)
 
 ```
 
@@ -1893,6 +1895,11 @@ In this section, we will create a workflow that encompasses both data preparatio
 
 ### Data Preparation Workflow
 
+The preparation recipe uses `step_mutate()` to bin continuous variables, merge factor levels, and create the specific interaction indicators. 
+The saved `levels_named_list` defines the complete factor order. Then `step_relevel()` explicitly sets each reference level.
+Bin boundaries and levels remain fixed at their previously selected values when baking new data, which need not contain observations in every bin. 
+Geographic enrichment remains a separate join before the recipe.
+
 ```{r data_prep_workflow}
 # Data enrichment
 
@@ -1925,106 +1932,104 @@ data_enrichment <- function(input_data) {
     return(output_data)
 }
 
-# Preparation workflow
+# Preparation recipe
 
-data_preparation_original_categorical <- function(input_data) {
-    # Convert original categorical features to factors and validate their levels
+data_preparation_recipe <- function(input_data) {
     if (!exists("original_categorical_features")) {stop("original_categorical_features object is missing")}
     if (!exists("levels_named_list")) {stop("levels_named_list object is missing")}
-    temp_data <- input_data
-    for (col in original_categorical_features) {
-        base_col <- col %>% gsub("_binned", "", .) %>% gsub("_merged", "", .) %>% gsub("_BIN", "", .)
-        if (!base_col %in% colnames(temp_data)) {stop(sprintf("Column %s is missing from input_data", base_col))}
-        temp_data[[base_col]] <- as.factor(temp_data[[base_col]])
-    }
-    temp_data$COVERAGE_BIN <- temp_data$COVERAGE %>% fct_collapse(
-        "TPL" = c("TPL"),
-        "OMN" = c("PO", "FO")
-    )
-    for (col in original_categorical_features) {
-        temp_data[[col]] <- factor(temp_data[[col]], levels = levels_named_list[[col]])
-    }
-    output_data <- temp_data
-    return(output_data)
-}
-
-data_preparation_binned_continuous <- function(input_data) {
     if (!exists("result_named_list")) {stop("result_named_list object is missing")}
     if (!exists("n_bins_named_list")) {stop("n_bins_named_list object is missing")}
     if (!exists("binned_continuous_features")) {stop("binned_continuous_features object is missing")}
-    temp_data <- input_data
-    for (col in binned_continuous_features) {
-        base_col <- col %>% gsub("_binned", "", .) %>% gsub("_merged", "", .)
-        if (!base_col %in% colnames(temp_data)) {stop(sprintf("Column %s is missing from input_data", base_col))}
-        result <- result_named_list[[base_col]]
-        n_bins <- n_bins_named_list[[base_col]]
-        bins <- rebuild_bins(result, n_bins)
-        temp_data[[paste0(base_col, "_binned")]] <- cut(temp_data[[base_col]], breaks = bins, ordered_result = TRUE, include.lowest = TRUE)
-        if (length(unique(temp_data[[paste0(base_col, "_binned")]])) != n_bins) {stop(sprintf("Binning mismatch for column %s", base_col))}
-    }
-    temp_data$AGEPH_binned_merged <- temp_data$AGEPH_binned %>% fct_collapse(
-        "(66,95]" = c("(66,68]", "(68,71]", "(71,95]"))
-    temp_data$POWER_binned_merged <- temp_data$POWER_binned %>% fct_collapse(
-        "(76,243]" = c("(76,83]", "(83,99]", "(99,243]")
-    )
-    for (col in binned_continuous_features) {
-        temp_data[[col]] <- factor(temp_data[[col]], levels = levels_named_list[[col]], ordered = FALSE)
-    }
-    output_data <- temp_data
-    return(output_data)
-}
+    if (!exists("binned_enriched_features")) {stop("binned_enriched_features object is missing")}
 
-data_preparation_enriched <- function(input_data) {
-    temp_data <- input_data
-    if (!"POPULATION" %in% colnames(temp_data)) {stop("Column POPULATION is missing from input_data")}
-    if (!"REGION" %in% colnames(temp_data)) {stop("Column REGION is missing from input_data")}
-    if (!"MUNICIPALITY" %in% colnames(temp_data)) {stop("Column MUNICIPALITY is missing from input_data")}
-    temp_data$POPULATION_binned <- cut(temp_data$POPULATION, breaks = rebuild_bins(
-        result_named_list[["POPULATION"]], n_bins_named_list[["POPULATION"]]
-    ), ordered_result = TRUE, include.lowest = TRUE) %>%
-    fct_collapse(
-        "(1.34e+05,4.53e+05]" = c("(1.34e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
-    )
-    temp_data$REGION_merged <- temp_data$REGION %>% as.factor() %>%
-        fct_collapse(
-            "Brussels" = c("RÉGION DE BRUXELLES-CAPITALE"),
-            "Others" = c("RÉGION WALLONNE", "RÉGION FLAMANDE")
+    # Ensure all required columns are present in the input data
+    factor_features <- c(original_categorical_features, binned_continuous_features)
+    base_features <- unique(gsub("_binned|_merged", "", binned_continuous_features))
+    required_columns <- c(original_categorical_features, base_features)
+    missing_columns <- setdiff(required_columns, colnames(input_data))
+    if (length(missing_columns) > 0) {
+        stop(sprintf("Columns missing from input_data: %s", paste(missing_columns, collapse = ", ")))
+    }
+
+    # Set all original categorical features as factors
+    rec <- recipe(~ ., data = input_data, strings_as_factors = FALSE) %>%
+        step_mutate(
+            across(all_of(!!original_categorical_features), as.factor)
         )
-    temp_data$MUNICIPALITY_binned <- ifelse(temp_data$MUNICIPALITY %in% levels_named_list[["MUNICIPALITY_binned"]], temp_data$MUNICIPALITY, "Other") %>%
-        as.factor()
-    for (col in binned_enriched_features) {
-        temp_data[[col]] <- factor(temp_data[[col]], levels = levels_named_list[[col]], ordered = FALSE)
-    }
-    output_data <- temp_data
-    return(output_data)
-}
 
-data_preparation_interaction <- function(input_data) {
-    if (!"BM_binned" %in% colnames(input_data)) {stop("Column BM_binned is missing from input_data")}
-    if (!"FUEL" %in% colnames(input_data)) {stop("Column FUEL is missing from input_data")}
-    temp_data <- input_data %>%
-        mutate(
+    # Bin the continuous features
+    for (col in c(base_features, "POPULATION")) {
+        n_bins <- n_bins_named_list[[col]]
+        if (is.null(result_named_list[[col]]) || is.null(n_bins)) {
+            stop(sprintf("Binning configuration is missing for column %s", col))
+        }
+        bins <- rebuild_bins(result_named_list[[col]], n_bins)
+        if (length(bins) != n_bins + 1 || anyNA(bins) || any(diff(bins) <= 0)) {
+            stop(sprintf("Invalid bin boundaries for column %s", col))
+        }
+        rec <- rec %>%
+            step_mutate(
+                !!paste0(col, "_binned") := cut(
+                    !!rlang::sym(col), breaks = !!bins,
+                    ordered_result = TRUE, include.lowest = TRUE
+                )
+            )
+    }
+
+    # Merge specific binned categories into broader categories
+    rec <- rec %>%
+        step_mutate(
+            AGEPH_binned_merged = fct_collapse(
+                AGEPH_binned, "(66,95]" = c("(66,68]", "(68,71]", "(71,95]")
+            ),
+            POWER_binned_merged = fct_collapse(
+                POWER_binned, "(76,243]" = c("(76,83]", "(83,99]", "(99,243]")
+            ),
+            REGION_merged = fct_collapse(
+                fct_expand(
+                    as.factor(REGION), "RÉGION DE BRUXELLES-CAPITALE",
+                    "RÉGION WALLONNE", "RÉGION FLAMANDE"
+                ),
+                "Brussels" = "RÉGION DE BRUXELLES-CAPITALE",
+                "Others" = c("RÉGION WALLONNE", "RÉGION FLAMANDE")
+            ),
+            MUNICIPALITY_binned = factor(ifelse(
+                MUNICIPALITY %in% !!levels_named_list[["MUNICIPALITY_binned"]],
+                as.character(MUNICIPALITY), "Other"
+            ))
+        )
+
+    # Set factor levels based on predefined levels_named_list and ensure they are unordered and with the correct reference level
+    for (col in factor_features) {
+        feature_levels <- levels_named_list[[col]]
+        if (is.null(feature_levels) || length(feature_levels) == 0) {
+            stop(sprintf("Factor levels are missing for column %s", col))
+        }
+        factor_expression <- rlang::expr(factor(
+            !!rlang::sym(col), levels = !!feature_levels, ordered = FALSE
+        ))
+        rec <- rec %>%
+            step_mutate(!!!setNames(list(factor_expression), col)) %>%
+            step_relevel(!!rlang::sym(col), ref_level = feature_levels[1])
+    }
+
+    # Add the two specific in
+    rec <- rec %>%
+        step_mutate(
             BM_01_FUEL_gasoline = BM_binned == "[0,1]" & FUEL == "gasoline",
             BM_01_FUEL_not_gasoline = BM_binned == "[0,1]" & FUEL != "gasoline"
-        )
-    output_data <- temp_data
-    return(output_data)
+        ) %>% prep()
+    return(rec)
 }
 
 data_preparation_workflow <- function(input_data) {
-    temp_data <- input_data %>%
-        data_enrichment %>%
-        data_preparation_original_categorical %>%
-        data_preparation_binned_continuous %>%
-        data_preparation_enriched %>%
-        data_preparation_interaction
-    output_data <- temp_data
+    enriched_data <- data_enrichment(input_data)
+    prepared_recipe <- data_preparation_recipe(enriched_data)
+    output_data <- bake(prepared_recipe, new_data = enriched_data)
     return(output_data)
 }
 ```
-
 ```{r test_data_preparation_enriched}
-
 test_data <- mtpl_be %>%
     filter(ID %in% data$ID) %>%
     data_preparation_workflow()
@@ -2034,7 +2039,12 @@ for (col in names(levels_named_list)) {
     data_enriched[[col]] <- factor(data_enriched[[col]], levels = levels_named_list[[col]], ordered = FALSE)
 }
 
-for (col in c(original_categorical_features, binned_continuous_features, enriched_features)) {
+prepared_features <- unique(c(
+    original_categorical_features, binned_continuous_features,
+    enriched_features, binned_enriched_features,
+    "BM_01_FUEL_gasoline", "BM_01_FUEL_not_gasoline"
+))
+for (col in prepared_features) {
     if (!col %in% colnames(test_data)) {
         stop(paste("Column", col, "is missing from test_data"))
     }
@@ -2046,11 +2056,13 @@ for (col in c(original_categorical_features, binned_continuous_features, enriche
 cat(sprintf("All columns in test_data match the enriched data.\n(%s)", paste(c(original_categorical_features, binned_continuous_features, enriched_features), collapse = ", ")))
 ```
 
+The preparation workflow works as expected and returns the same dataset as the one obtained throught data preparation. 
+As this data transformation is the base for all subsequent modeling steps, we apply it once and we will reuse the prepared data throughout the analysis.
+
 ### Cross-Validation Strategy
 
 To better understand cross-validation, let's illustrate it with a simple manual example.
 We create 5 data sets (folds) for cross-validation. Each fold will be used once as a validation set while the remaining folds form the training set.
-
 ```{r illustration_cv}
 cv_split <- function(input_data, kfold, strata) {
     folds <- input_data %>% vfold_cv(strata = strata, v = kfold)
@@ -2080,14 +2092,15 @@ cat(sprintf("Cross-validated log loss: min = %s, mean = %s, max = %s\n", min(unl
 cat(sprintf("Cross-validated beta0: min = %s, mean = %s, max = %s\n", min(unlist(beta0)), mean(unlist(beta0)), max(unlist(beta0))))
 ```
 
-This illustrates how cross-validation enables enables to check the robustness and variability of the model's performance and parameter estimates across different subsets of the data.
-Comparing the cross-validated mean log loss, AIC or BIC across various models will yield a more robust choice for model selection. Now that the intuition is set, we can create our workflow including cross-validation.
+This illustrates how cross-validation enables us to check the robustness and variability of the model's performance and parameter estimates across different subsets of the data.
+Comparing the cross-validated performance metrics across various models will yield a more robust choice for model selection. Now that the intuition is set, we can create our workflow including cross-validation.
 
 ### Performance Metrics and Nested Model Comparison
 
-To compare the performance of different models, we can consider the following cross-validated metrics:
+To compare the performance of different models, we will consider the cross-validated prediction error and log loss, and the information criteria (AIC and BIC).
 
-- Log Loss: Measures predictive accuracy by evaluating the negative log-likelihood (scaled by the number of observations) of the observed outcomes given the predicted probabilities.
+- Log Loss (CV): Measures predictive accuracy by evaluating the negative log-likelihood (scaled by the number of observations) of the observed outcomes given the predicted probabilities.
+- Prediction Error (CV): Measures
 - AIC (Akaike Information Criterion): Evaluates model quality by balancing goodness of fit and model complexity. Lower values indicate better models.
 - BIC (Bayesian Information Criterion): Similar to AIC, but with a stronger penalty for model complexity. Lower values indicate better models.
 
@@ -2147,15 +2160,14 @@ anova(m_null, m_ex, test = "Chisq")
 
 ```{r glm_workflow}
 
-create_wflow_freq_glm <- function(data, formula, v = 5, seed = 123) {
+create_wflow_freq_glm <- function(data, formula, v = 5, rec=recipe(NCLAIMS ~ ., data = data), seed = 123) {
 
     set.seed(seed)
     folds <- vfold_cv(
-        data, v = v, 
+        data, 
+        v = v, 
         strata = NCLAIMS
     )
-
-    rec <- recipe(as.formula(formula), data = data)
 
     # The Poisson family uses a log link by default
     mod <- poisson_reg() %>%
@@ -2163,7 +2175,7 @@ create_wflow_freq_glm <- function(data, formula, v = 5, seed = 123) {
 
     wflow <- workflow() %>%
         add_recipe(rec) %>%
-        add_model(mod)
+        add_model(mod, formula = as.formula(formula))
 
     cv_results <- fit_resamples(
         wflow,
@@ -2244,8 +2256,8 @@ append_performance_metrics <- function(name, formula, result, perf_df = perf_met
     rbind(perf_df, new_row)
 }
 
-f0 <- "NCLAIMS ~ 1"
-fcat <- paste0("NCLAIMS ~ ", paste(original_categorical_features, collapse = " + "))
+f0 <- "NCLAIMS ~ offset(log(EXP))"
+fcat <- paste0(f0, " + ", paste(original_categorical_features, collapse = " + "))
 cat(sprintf("> Categorical formula: %s", fcat))
 
 r0 <- create_wflow_freq_glm(train_data, f0)
