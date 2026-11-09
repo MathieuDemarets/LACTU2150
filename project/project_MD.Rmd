@@ -1185,11 +1185,13 @@ Two different anova tests will be used: variable-wise ANOVA tests to assess the 
 We will compare the deviance of the model with the variable as single predictor to the null model with only the offset term. This will allow us to test if the variable significantly improves the model fit:
 
 $H_0: \Delta D = D_0 - D_1 = 0$
+
 $H_1: \Delta D = D_0 - D_1 > 0$
 
 For our test statistic we have $\Delta D \sim \chi^2_{df}$, where $df$ is the difference in the number of parameters between the null and alternative models.
 
 Our $D_0$ represents the deviance of the null model with only the offset term: `glm(NCLAIMS ~ offset(log(EXP)), poisson(link = "log"))`.
+
 The $D_1$ represents the deviance of the model with the variable as a single predictor: `glm(NCLAIMS ~ offset(log(EXP)) + get(var), poisson(link = "log"))`.
 
 ```{r null_model}
@@ -1314,13 +1316,14 @@ The raw continuous variables were not examined either. They will be analysed in 
 Besides the existing features, we can create additional features to add information to our design matrix and potentially improve our models.
 
 - **Geospatial Features**:
-We will first explore the existing `PC` and `TOWN` variables`. Note that these are simply categorical representations of the longitude and latitude for different granularities of location.
-We will then explore different granularities and use the spatial information to enrich our feature set.
+We will take a theoretical detour to better understand how locations are classified in Belgium according to the `NIS code` nomenclature. Ideally, this hierarchical structure should be used as the basis of a credibility model for hierarchical features.
+This is outside the scope of this assignment. We will instead explain how a location can be represented as numerical or categorical and what it means in terms of interpretation.
+We will then use the NIS codes to fetch the Region linked to each location, retrieve the population density in the postcode and create a transformed municipality-level feature to capture biggest municipalities only.
 
 - **Polynomial Features**:
 As we will see in the modelling section, adding polynomial features can be a good way to capture non-linear relationships in our GLM models.
 This is an intermediate step towards the smoothing functions of Generalized Additive Models (GAMs).
-We can test the second and third degree polynomial features for continuous variables and bin the statistically significant features to create new categorical variables for our GLM.
+We can test the first, second and third degree polynomial features for continuous variables to better understand their relationship with the target variables (frequency and severity).
 Note that this is less straighforward to explain to a customer. It is best used in technical premium modeling but should likely be removed from the commercial premium models.
 
 - **Interaction Features**:
@@ -1354,14 +1357,15 @@ The **categorical** features will capture administrative and political divisions
 When we look at **transition risk**, this becomes particularly relevant. For example, when the Brussels-Capital Region restricted the access to old diesel vehicles, this became stranded assets for owners of such vehicles within the region.
 Regions can take other decisions that impact risk exposure, such as subsidising electric vehicles, promoting public transportation, or offering advantageous schemes for company cars. This will play a role in the behavioral patterns and risk exposure of vehicle owners within the region.
 
-We should not "choose" between granularities as they capture different underlying information. 
-However, **multicollinearity** is a clear risk when working with various granularities of a same feature which can lead to unstable model with hard-to-interpret individual feature effects.
+We should not "choose" between granularities as they capture different underlying information. The credibility approach with hierarchical levels is a good way to account for many nested levels that would not yield stable estimates in a traditional model.
+However, we are working with a traditional GLM in this assignment and keeping all granularities gives a big risk of **near multicollinearity**.
 In our dataset, we already have the postcode (`r length(unique(data$PC))` levels) and town (`r length(unique(data$TOWN))` levels) which seem to capture the same underlying geographical information and the `LAT` and `LONG` features.
 
-To avoid redundancy, we will drop the `TOWN` feature and keep the `PC` which is part of the official NIS nomenclature.
-`LAT` and `LONG` will also be kept as numerical input for the smoothing functions we will use in the GAM models.
-To capture political and administrative underlying factors, we will add the `Regions` feature as a categorical variable.
-Finally, we will fetch the demographic density for each postcode which will serve as a proxy for urbanization and traffic exposure. 
+- To avoid redundancy, we will drop the `TOWN` feature and keep the `PC` which is part of the official NIS nomenclature.
+- `LAT` and `LONG` will also be kept as numerical input for the smoothing functions we will use in the GAM models.
+- To capture political and administrative underlying factors, we will add the `Regions` feature as a categorical variable.
+- Finally, we will fetch the demographic density for each postcode which will serve as a proxy for urbanization and traffic exposure. 
+
 We expect higher frequency of claims and lower severity in areas with higher demographic density, as traffic congestion may lead to more minor accidents rather than severe ones.
 Conversely, we expect lower frequency and higher severity in more rural areas.
 It will be interesting to control the predictive power of postcode with demographic density to see if it has predictive power beyond what is captured by urbanization and traffic exposure.
@@ -1510,41 +1514,7 @@ cat(sprintf("Is the effect of POPULATION_binned significant at 95%% confidence? 
 plot_freq_sev(data_enriched, "POPULATION_binned")
 ```
 
-The variable is significant at 95% confidence, however we see that the 3 largest population bins have very similar claim frequencies, we can try merging them to get have a simple three-level binning (Low, Medium, High Density).
-
-```{r merged_population}
-initial_bins_merged <- data_enriched$POPULATION_binned
-
-three_bins_merged <- fct_collapse(
-    data_enriched$POPULATION_binned,
-    "Low Density" = c("[995,7.68e+03]"),
-    "Medium Density" = c("(7.68e+03,4.3e+04]"),
-    "High Density" = c("(4.3e+04,1.34e+05]", "(1.34e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
-)
-
-m1 <- glm(NCLAIMS ~ offset(log(EXP)) + initial_bins_merged, data = data_enriched, family = poisson(link = "log"))
-m0 <- glm(NCLAIMS ~ offset(log(EXP)) + three_bins_merged, data = data_enriched, family = poisson(link = "log"))
-test_pop <- anova(m0, m1, test = "Chisq")
-cat(sprintf("Are we loosing significant information by merging the population bins? %s (p-value: %.4f)", ifelse(test_pop$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_pop$`Pr(>Chi)`[2]))
-
-four_bins_merged <- fct_collapse(
-    data_enriched$POPULATION_binned,
-    "(1.34e+05,4.53e+05]" = c("(1.34e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
-)
-
-m0 <- glm(NCLAIMS ~ offset(log(EXP)) + four_bins_merged, data = data_enriched, family = poisson(link = "log"))
-test_pop_four <- anova(m0, m1, test = "Chisq")
-cat(sprintf("Are we loosing significant information by merging the last two population bins? %s (p-value: %.4f)", ifelse(test_pop_four$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_pop_four$`Pr(>Chi)`[2]))
-```
-
-Based on the result of the anova test, it seems that merging the bins into three levels does not significantly increase the residual deviance. We'll therefore adopt the three-level binning for the population variable which is a lot easier to interpret and work with.
-
-```{r three_bins_plot}
-data_enriched$POPULATION_binned <- four_bins_merged
-plot_claim_freq(data_enriched, "POPULATION_binned")
-```
-
-We get a linear trend in claim frequency with respect to population density bins (ordinal variable).
+The variable is significant at 95% confidence. We see that the 2 largest population bins have very similar claim frequencies, however, merging them would remove the distinction between these two bins that we see for the average claim cost.
 
 #### Regions
 
@@ -1555,10 +1525,11 @@ m0 <- glm(NCLAIMS ~ offset(log(EXP)), data = data_enriched, family = poisson(lin
 m1 <- glm(NCLAIMS ~ offset(log(EXP)) + REGION, data = data_enriched, family = poisson(link = "log"))
     test_result <- anova(m0, m1, test = "Chisq")
     cat(sprintf("Is variable %s significant? %s\n", "REGION", ifelse(test_result$`Pr(>Chi)`[2] < test_level, "Yes", "No")))
-plot_claim_freq(data_enriched, "REGION")
+plot_freq_sev(data_enriched, "REGION")
 ```
 
-It is clear that the Brussels region has a distinct claim frequency pattern compared to the other regions. We'll test if it makes sense to keep the Walloon and Flemish regions separate as well or not.
+It is clear that the Brussels region has a distinct claim frequency and severity pattern compared to the other regions. It is interesting to note that the frequency is higher while the severity is lower, which aligns with our hypothesis about urban areas.
+We'll test if it makes sense to keep the Walloon and Flemish regions separated as well or not (as before, the test is made on the claim frequency using a chi-squared test).
 
 ```{r region_significance}
 merged_regions <- fct_collapse(
@@ -1571,18 +1542,16 @@ m0 <- glm(NCLAIMS ~ offset(log(EXP)) + REGION, data = data_enriched, family = po
 m1 <- glm(NCLAIMS ~ offset(log(EXP)) + REGION_merged, data = data_enriched, family = poisson(link = "log"))
 test_result <- anova(m0, m1, test = "Chisq")
 cat(sprintf("Was it justified to merge the REGION bins? %s", ifelse(test_result$`Pr(>Chi)`[2] < test_level, "No", "Yes")))
-plot_claim_freq(data_enriched, "REGION_merged")
+plot_freq_sev(data_enriched, "REGION_merged")
 ```
 
-We see that despite a much lower exposure in Brussels, the claim frequency is significantly higher from the other regions.
-This confirms our hypothesis that urban areas, such as Brussels, tend to have a higher claim frequency compared to less densely populated regions.
-We can quickly check our second hypothesis that despite higher frequencies, the severity is lower in urban areas like Brussels.
+We see that despite a much lower exposure in Brussels, the claim frequency is significantly higher from the other regions. The severity, although not significantly because of high variability, appears to be lower in Brussels compared to the other regions.
+This confirms our hypothesis that urban areas, such as Brussels, tend to have a higher claim frequency compared to less densely populated regions but that these accidents tend to have a lower severity:
 
 ```{r severity_by_region}
 urb_rur_comp <- data_enriched %>%
     group_by(REGION_merged) %>%
     summarise(
-        total_claims = sum(NCLAIMS),
         total_exposure = sum(EXP),
         total_claims = sum(NCLAIMS),
         total_claim_amount = sum(AMOUNT),
@@ -1608,7 +1577,7 @@ We expect to see similar effects for other granularities, such as municipalities
 
 #### Municipalities
 
-There are far too many municipalities to use it as a simple categorical variable in our models. We can thus focus on the n largest municipalities by exposure and group the remaining ones into an "Other" category.
+There are far too many municipalities to use it as a simple categorical variable in our models. Hierachical credibility are out of scope. We can thus focus on the n largest municipalities by exposure and group the remaining ones into an "Other" category.
 
 ```{r municipalities_aggregation}
 data_enriched %>%
@@ -1616,10 +1585,13 @@ data_enriched %>%
     summarise(
         total_exposure = sum(EXP)
     ) %>%
-    arrange(desc(total_exposure)) %>% head(n=50) %>%
-    ggplot(aes(x = reorder(MUNICIPALITY, -total_exposure), y = total_exposure)) +
+    arrange(desc(total_exposure)) %>% head(n=30) %>%
+    mutate(category = ifelse(row_number() <= 6, "Selected", "Other")) %>%
+    ggplot(aes(x = reorder(MUNICIPALITY, -total_exposure), y = total_exposure, fill = category)) +
     geom_bar(stat = "identity") +
-    labs(x = "Municipality", y = "Total Exposure") +
+    scale_fill_manual(values = c("Selected" = "steelblue", "Other" = "lightgrey")) +
+    labs(x = "Municipality", y = "Total Exposure", fill = "Category", title = "Top 30 Municipalities by Exposure") +
+    theme_minimal() +
     theme(axis.text.x = element_text(angle = 45, hjust = 1))
 ```
 
@@ -1636,7 +1608,7 @@ exp_breakpoint <- data_enriched %>%
 data_enriched$MUNICIPALITY_binned <- ifelse(data_enriched$MUNICIPALITY %in% exp_breakpoint$MUNICIPALITY, as.character(data_enriched$MUNICIPALITY), "Other")
 data_enriched$MUNICIPALITY_binned <- factor(data_enriched$MUNICIPALITY_binned) %>% fct_infreq()
 
-plot_claim_freq(data_enriched, "MUNICIPALITY_binned")
+plot_freq_sev(data_enriched, "MUNICIPALITY_binned")
 m0 <- glm(NCLAIMS ~ offset(log(EXP)), data = data_enriched, family = poisson(link = "log"))
 m1 <- glm(NCLAIMS ~ MUNICIPALITY_binned + offset(log(EXP)), data = data_enriched, family = poisson(link = "log"))
 results <- anova(m0, m1, test = "Chisq")
@@ -1646,6 +1618,7 @@ cat(sprintf("Is variable %s significant? %s\n", "MUNICIPALITY_binned", ifelse(re
 We now have a binned version of the MUNICIPALITY variable which is significant and usable in our model. Of course, the exposure is limited even in the bigger municipalities and that causes some variability in the frequency estimates.
 However, for the sake of interpretation, we'll keep the cities separated even though Charleroi and Antwerp are similar in terms of frequency and so are Gand and Liège.
 We seem to capture a similar phenomenon with cities having a higher claim frequency compared to smaller municipalities even if the effect is less clear than for the regions.
+What is also striking is that average claim cost is much higher in Charleroi than anywhere else.
 
 ```{r desc_top_municipalities}
 data_enriched %>%
@@ -1718,8 +1691,8 @@ pheatmap(correlation_matrix,
 )
 ```
 
-We first notice that `AGEC`is not significantly correlated with `NCLAIMS` when considered with the first and second-degree polynomial features.
-As we saw before, the non-linear effect is captures in our binning. An alternative approach could have been to use the third-degree polynomial.
+We first notice that `AGEC` is not significantly correlated with `NCLAIMS` when considered with the first and second-degree polynomial features.
+As we saw before, the non-linear effect for this variable is captured in our WoE binning. An alternative approach could have been to use the third-degree polynomial.
 We would still have the issue of fixed effects being imposed by the polynomial terms, which might not fully capture the underlying non-linear relationship.
 This is a good example of why binning can sometimes be more flexible in capturing non-linear relationships compared to fixed polynomial terms.
 
@@ -1766,9 +1739,8 @@ pheatmap(orth_correlation_matrix,
 
 From this orthogonal polynomial feature exploration we can conclude that:
 
-- Polynomial features are more significantly correlated with the number of claims (`NCLAIMS`) than with the average claim amount (`AVG`).
-- Orthogonal polynomial features help assess whether each polynomial term contributes significantly to the relationship with the target variables, without being confounded by multicollinearity.
-- There is no clear rule to know if first, second, and/or third-degree polynomial terms are significant. The WoE-based binning approach provides a more flexible and interpretable way to capture non-linear effects.
+- Polynomial features are more significantly correlated with the number of claims (`NCLAIMS`) than with the average claim amount (`AVG`) which can simply be due to lesser observations for the latter.
+- Orthogonal polynomial features help assess whether each polynomial term contributes significantly to the relationship with the target variables, without being confounded by multicollinearity. This will serve as benchmark to the smoothing functions in the GAM models.
 
 In conclusion, polynomials are a way to capture non-linear relationships. However, the incremental effect of these polynomial terms is still fixed in a GLM.
 We therefore prefer working with binned features rather than relying solely on polynomial terms.
@@ -1784,7 +1756,7 @@ Watch out the decision trees are not robusts and can be sensitive to small chang
 ```{r interaction-tree}
 
 tree_model <- rpart(
-    NCLAIMS ~ COVERAGE_BIN + FUEL + FLEET + SEX + # Categorical features
+    NCLAIMS ~ COVERAGE + FUEL + FLEET + SEX + # Categorical features
     BM_binned + AGEPH_binned_merged + AGEC_binned + POWER_binned_merged + # Binned numerical features
     POPULATION_binned + REGION_merged + MUNICIPALITY_binned, # Enriched features
     data = data_enriched,
@@ -1831,10 +1803,13 @@ data_enriched <- data_enriched %>%
 - `REGION_merged` x `POWER_binned_merged`
 - `BM_binned` x `REGION_merged`
 
+This concludes the feature engineering and more generally the data preparation phase. We now have a set of enriched, transformed, binned, and merged features ready for the modelling phase.
+We will start the next section by listing this set of variables and looking at the reference class.
+
 # Frequency Modeling
 
-Now that we have explored, transformed, and enriched our data. We are ready to proceed with the modelling phase. We have a rich set of features to gradually incorporate into our models to improve predictive performance.
-We will also clean all intermediary objects that won't be used for modelling.
+Now that we have explored, transformed, and enriched our data. We are ready to proceed with the modelling phase. As described in the Approach section of the Introduction, we will go from the null model (with the offset only) towards more complex models by gradually incorporating features and keeping the significant ones.
+Below is a list of the variables and their 5 first levels per layer of complexity.
 
 ```{r prep_modelling}
 # Clean intermediary objects not used for modelling
@@ -1846,7 +1821,7 @@ rm(list = setdiff(ls(), c(
     functions)))
 cat(sprintf("Remaining objects and functions: %s", paste(ls(), collapse = ", ")))
 
-original_categorical_features <- c("COVERAGE_BIN", "FUEL", "FLEET", "SEX")
+original_categorical_features <- c("COVERAGE", "FUEL", "FLEET", "SEX")
 continuous_features <- c("BM", "AGEPH", "AGEC", "POWER")
 binned_continuous_features <- c("BM_binned", "AGEPH_binned_merged", "AGEC_binned", "POWER_binned_merged")
 enriched_features <- c("REGION_merged", "MUNICIPALITY_binned", "POPULATION")
@@ -1861,27 +1836,37 @@ for (col in c(original_categorical_features, binned_continuous_features, binned_
 ```
 
 **Original Categorical Features:**
-Note that `USE` was excluded because it was not statistically significant in preliminary analyses. And `COVERAGE` was transformed into `COVERAGE_BIN` after merging the partial and full omnium levels that did not significantly add information.
+Note that `USE` was excluded because it was not statistically significant in preliminary analyses. The variables for the first set of predictors are:
 
-- `COVERAGE_BIN`
-- `FUEL`
-- `FLEET`
-- `SEX`
+```{r original_categorical_features}
+for (col in original_categorical_features) {
+    cat(sprintf("Levels for %s: %s\n", col, paste(head(levels_named_list[[col]],5), collapse = ", ")))
+}
+```
+
+The reference levels will thus represent male policyholders with a third-party liability coverage only for a gasoline-fueled vehicle which is not part of a fleet.
 
 **Continuous Features:**
 The continuous features as such will be included in the GAM models only. We binned and merged them into categorical variables for the GLM modelling.
 
-- `BM` -> `BM_binned`
-- `AGEPH` -> `AGEPH_binned_merged`
-- `AGEC` -> `AGEC_binned`
-- `POWER` -> `POWER_binned_merged`
+```{r binned_continuous_features}
+for (col in binned_continuous_features) {
+    cat(sprintf("Levels for %s: %s\n", col, paste(head(levels_named_list[[col]],5), collapse = ", ")))
+}
+```
+
+The reference levels are here defined by the first level of each binned continuous feature. We therefore have a policyholder between 18 and 24 years old with a new car (less than 1 year old) of 10 to 33 kilowatts of power and a bonus-malus score of 0.
 
 **Enriched Features:**
 Based on geospation information, we have created, binned and merged both categorical and continuous features to capture urban/rural distinctions and municipality-level characteristics.
 
-- `REGION_merged`
-- `MUNICIPALITY_merged`
-- `POPULATION` -> `POPULATION_binned`
+```{r binned_enriched_features}
+for (col in binned_enriched_features) {
+    cat(sprintf("Levels for %s: %s\n", col, paste(head(levels_named_list[[col]],5), collapse = ", ")))
+}
+```
+
+The reference for these enriched features is a policyholder living in a small municipality (995 to 7680 inhabitants) outside of Brussels and the other main urban areas.
 
 **Interaction Features:**
 We have also created specific and variable interaction features based on expert knowledge and the decision tree analysis.
@@ -1900,10 +1885,10 @@ We will then be able to see whether the GAM results confirm our exploratory anal
 
 ## Validation Framework
 
-Remember that at the start of the Data Preparation chapter, we kept a holdout set separate from the training data for model validation purposes.
-We will now create a workflow including:
+The modelling exercise will be conducted on our training dataset, while keeping the holdout set separate for final model validation. 
+In this section, we will create a workflow that encompasses both data preparation and model selection steps (including cross-validation).
 
-- **Data Preparation**: enriching the dataset and transforming features as described in the previous sections.
+- **Data Preparation**: starting from the enriched dataset, applying necessary transformations as described in the data preparation section.
 - **Model Selection**: fitting and evaluating the selected models to the prepared training data with a 5-fold cross-validation.
 
 ### Data Preparation Workflow
@@ -1940,7 +1925,7 @@ data_enrichment <- function(input_data) {
     return(output_data)
 }
 
-# Step 2: Data Preparation
+# Preparation workflow
 
 data_preparation_original_categorical <- function(input_data) {
     # Convert original categorical features to factors and validate their levels
