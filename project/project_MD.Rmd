@@ -1891,7 +1891,8 @@ The modelling exercise will be conducted on our training dataset, while keeping 
 In this section, we will create a workflow that encompasses both data preparation and model selection steps (including cross-validation).
 
 - **Data Preparation**: starting from the enriched dataset, applying necessary transformations as described in the data preparation section.
-- **Model Selection**: fitting and evaluating the selected models to the prepared training data with a 5-fold cross-validation.
+- **Performance Evaluation**: the correct performance metrics need to be optimized for in order to pick the best model and avoid overfitting.
+- **Model Workflow**: the complete modeling workflow will then be specified separately for frequence and severity and for GLM and GAM models in the next sections.
 
 ### Data Preparation Workflow
 
@@ -2059,72 +2060,60 @@ cat(sprintf("All columns in test_data match the enriched data.\n(%s)", paste(c(o
 The preparation workflow works as expected and returns the same dataset as the one obtained throught data preparation. 
 As this data transformation is the base for all subsequent modeling steps, we apply it once and we will reuse the prepared data throughout the analysis.
 
-### Cross-Validation Strategy
+### Performance Evaluation
 
-To better understand cross-validation, let's illustrate it with a simple manual example.
-We create 5 data sets (folds) for cross-validation. Each fold will be used once as a validation set while the remaining folds form the training set.
-```{r illustration_cv}
-cv_split <- function(input_data, kfold, strata) {
-    folds <- input_data %>% vfold_cv(strata = strata, v = kfold)
-    return(folds)
-}
-base_formula <- "NCLAIMS ~ offset(log(EXP))"
-folds <- mtpl_be %>%
-    filter(ID %in% data$ID) %>%
-    data_preparation_workflow() %>%
-    cv_split(kfold = 5, strata = "NCLAIMS")
-models <- vector("list", length(folds$splits))
-poisson_log_loss_list <- list()
-beta0 <- list()
-for (i in seq_along(folds$splits)) {
-    train_data <- analysis(folds$splits[[i]])
-    val_data <- assessment(folds$splits[[i]])
-    models[[i]] <- glm(formula = as.formula(base_formula), data = train_data, family = poisson(link = "log"))
-    log_loss <- -mean(dpois(val_data$NCLAIMS, lambda = predict(models[[i]], newdata = val_data, type = "response"), log = TRUE))
-    poisson_log_loss_list[[i]] <- log_loss
-    beta0[[i]] <- coef(models[[i]])[1]
-}
-m0 <- glm(formula = as.formula(base_formula), data = mtpl_be %>% filter(ID %in% data$ID) %>% data_preparation_workflow(), family = poisson(link = "log"))
-beta0_full <- coef(m0)[1]
-log_loss_full <- -mean(dpois(holdout$NCLAIMS, lambda = predict(m0, newdata = holdout, type = "response"), log = TRUE))
-cat(sprintf("For the simple GLM model:\n  Log loss (-log-likelihood/n): %s\n  Intercept (beta0): %s\n  95%% CI for beta0: [%s, %s]\n", log_loss_full, beta0_full, beta0_full - 1.96 * summary(m0)$coefficients[1,2], beta0_full + 1.96 * summary(m0)$coefficients[1,2]))
-cat(sprintf("Cross-validated log loss: min = %s, mean = %s, max = %s\n", min(unlist(poisson_log_loss_list)), mean(unlist(poisson_log_loss_list)), max(unlist(poisson_log_loss_list))))
-cat(sprintf("Cross-validated beta0: min = %s, mean = %s, max = %s\n", min(unlist(beta0)), mean(unlist(beta0)), max(unlist(beta0))))
-```
+To robustly evaluate the performance of our models, we will use a 5-fold cross-validation approach. This means that 5 samples will be created from the training data (with the number of claims as evenly distributed as possible across the folds).
+Then, for each of the five folds, one fold will be used as the validation set while the remaining four folds will be used as the training set. The performance metrics will then be computed for slight variations in the training and validation sets, providing a more robust estimate of model performance.
 
-This illustrates how cross-validation enables us to check the robustness and variability of the model's performance and parameter estimates across different subsets of the data.
-Comparing the cross-validated performance metrics across various models will yield a more robust choice for model selection. Now that the intuition is set, we can create our workflow including cross-validation.
+More specifically, we will look at two different cross-validation metrics: the log-loss and the (decomposed) prediction error.
 
-### Performance Metrics and Nested Model Comparison
+1. Cross-Validated `Log-loss`
 
-To compare the performance of different models, we will consider the cross-validated prediction error and log loss, and the information criteria (AIC and BIC).
+The log-loss is a measure based on the likelihood of the observed data given the predicted probabilities. 
+The negative mean log-likelihood is used as the loss function. Note that the likelihood function depends on the assumed distribution poisson(log) or gamma(log)).
+For our frequency model, which assumes a Poisson distribution with a log link, the log-loss will then be:
 
-- Log Loss (CV): Measures predictive accuracy by evaluating the negative log-likelihood (scaled by the number of observations) of the observed outcomes given the predicted probabilities.
-- Prediction Error (CV): Measures
-- AIC (Akaike Information Criterion): Evaluates model quality by balancing goodness of fit and model complexity. Lower values indicate better models.
-- BIC (Bayesian Information Criterion): Similar to AIC, but with a stronger penalty for model complexity. Lower values indicate better models.
+$$
+\text{Log-loss} = -\frac{1}{n} \sum_{i=1}^{n} \log \left( P(Y_i \mid \hat{\lambda}_i) \right)
+$$
+where \(Y_i\) is the observed number of claims for the \(i\)-th observation, and \(\hat{\lambda}_i\) is the predicted mean from the Poisson model.
 
-Note that the `Log- Loss`, `AIC` and `BIC` are all based on the likelihood of the model, here are how they are computed:
+The function `dpois` in R will be used with `NCLAIMS` as the observed values and the predicted mean from the Poisson model as the lambda parameter. We'll use log=TRUE to get the log-probabilities and be able to average them and then take the negative to compute the log-loss.
 
-- Log Loss: `-mean(dpois(y, lambda = predicted_lambda, log = TRUE))` or `-logLik(model)/n` where `n` is the number of observations.
-- AIC: `2 * k - 2 * logLik(model)` where `k` is the number of parameters.
-- BIC: `log(n) * k - 2 * logLik(model)` where `n` is the number of observations and `k` is the number of parameters.
+2. Cross-Validated `Prediction error`
 
-We see that `Log loss`simply does not account for model complexity, unlike `AIC` and `BIC` which include penalties of 2 * k and `r log(nrow(data)*(4/5))`[^logn] * k respectively. 
-Because the penalty is so much higher, due to the large size of our portfolio, `BIC` tends to favor simpler models compared to `AIC`.
+The prediction error is a measure of the difference between the observed and predicted values for new data points that can be split between the training error and the optimism (difference between training and prediction error which can be seen as a complexity penalty):
 
-[^logn]: The term `log(nrow(data)*(4/5))` comes from the fact that we are using cross-validation with 5 folds, so each training set contains 4/5 of the data.
+$$
+\mathbb{E}[(Y_i^{\text{new}} - \hat{Y}_i)^2] = \mathbb{E}[(Y_i - \hat{Y}_i)^2] + 2 Cov(Y_i, \hat{Y}_i)
+$$
 
-The models will be gradually complexified by adding covariates. For each step, we will compare the final model with the previous step based on:
+The training error can be replaced by the deviance \(D\), which measures the goodness of fit of the model to the training data. The optimism term \(2 Cov(Y_i, \hat{Y}_i)\) can be approximated by the penalty term \(\frac{2(p+1)}{n}\), where \(p\) is the number of parameters and \(n\) is the sample size.
 
-- Scaled Residual Deviance: Measures the goodness of fit of a model relative to a saturated model, scaled by the residual deviance of the null model.
-- Anova Test: Compares nested models by evaluating whether the addition of new covariates significantly improves the model fit.
+$$
+\text{Prediction error} = D + \frac{2(p+1)}{n}
+$$
 
-For the scaled residual deviance, here are the maximum and minimum deviance values:
+We will also log the deviance and complexity penalty separately to interpret the contribution of each to the overall prediction error.
+
+The log loss should simply indicate how close we are getting to the true distribution whereas the prediction error focuses on the accuracy of the predicted values for new observations with a complexity penalty to avoid overfitting.
+Comparing both should help us picking the most balanced model. 
+
+3. `Information Criteria`
+
+To confirm the prediction error, we will also look at the AIC and BIC on the full training data model. 
+These information criteria are also built on the likelihood of the model and a penalty for model complexity (AIC uses `2 * k` and BIC uses `log(n) * k`, where `k` is the number of parameters and `n` is the sample size).
+They should thus provide similar ranking as the cross-validated prediction error with possible divergence due to the different ways complexity is penalized.
+
+4. `Nested Model Comparison`
+
+At the end of each complexity layer (set of covariates added), we will compare the current model with the previous best model with an anova test to evaluate whether the addition of new covariates significantly improves the model fit.
+The anova test is based on the comparison of the deviance of nested models, which follows a chi-squared distribution under the null hypothesis that the simpler model is sufficient.
 
 - Null Deviance: $D_0 = 2 \times \left( logLik(SaturatedModel) - logLik(NullModel) \right)$
 - Residual Deviance: $D_m = 2 \times \left( logLik(SaturatedModel) - logLik(FittedModel) \right)$
-- Scaled Residual Deviance: $D_s = \frac{D_m}{D_0}$
+
+Let's visualize the link between deviance and log-likelihood for the nested models: null and model with BM_binned covariate. Calculated deviance should match the residual deviance for each model and is defined as $D_m = 2 \times \left( logLik(SaturatedModel) - logLik(FittedModel) \right)$.
 
 ```{r full_model_deviance}
 train_data <- mtpl_be %>%
@@ -2132,31 +2121,42 @@ train_data <- mtpl_be %>%
     data_preparation_workflow()
 m_null <- glm(NCLAIMS ~ offset(log(EXP)), family = poisson, data = train_data)
 m_ex <- glm(NCLAIMS ~ offset(log(EXP)) + BM_binned, family = poisson, data = train_data)
-cat(sprintf(
-    "Scaled Residual Deviance: %.2f%% (%.0f / %.0f)", 
-    deviance(m_ex) / deviance(m_null)*100,
-    deviance(m_ex),
-    deviance(m_null)
-))
 
-ll_sat <- deviance(m_null)/2 + logLik(m_null)
-calc_dm <- 2 * (ll_sat - logLik(m_ex))
-cat(sprintf(
-    "Calculated D_m = %.2f and Model Deviance = %.0f", 
-    calc_dm,
-    deviance(m_ex)
-))
-cat(sprintf("We thus have maximum log likelihood for the saturated model: %.2f", ll_sat))
-cat(sprintf("And minimum log likelihood for the null model: %.2f", logLik(m_null)))
+ll_null <- logLik(m_null)
+ll_ex <- logLik(m_ex)
+d_null <- deviance(m_null)
+d_ex <- deviance(m_ex)
+ll_sat <- d_null/2 + ll_null
+d_sat <- 0
+calc_d_null <- 2 * (ll_sat - ll_null)
+calc_d_ex <- 2 * (ll_sat - ll_ex)
+
+data.frame(
+    Model = c("Null", "Saturated", "BM_binned"),
+    LogLik = c(as.numeric(ll_null), as.numeric(ll_sat), as.numeric(ll_ex)),
+    Deviance = c(d_null, d_sat, d_ex),
+    Calculated_Deviance = c(calc_d_null, d_sat, calc_d_ex)
+) %>% kable(
+    caption = "Example Deviance and Log-Likelihood for Nested Models",
+    booktabs = TRUE
+)
 ```
 
-The anova test will be comparing the deviance of the nested models to evaluate whether the addition of new covariates significantly improves the model fit.
+The Chi-squared anova test will be comparing the difference of the deviance of the nested models to evaluate whether the addition of new covariates significantly improves the model fit:
+
+The test statistic is calculated as $\chi^2 = D_0 - D_m$
+
+where $D_0$ is the deviance of the null model and $D_m$ is the deviance of the model with additional covariates. Under the null hypothesis, this statistic follows a chi-squared distribution with degrees of freedom equal to the difference in the number of parameters between the models.
+The null hypothesis states that the simpler model is sufficient, meaning that the additional covariates do not significantly improve the model fit. Concretely, if the p-value from the chi-squared test is lower than our chosen significance level of 5%, we reject the null hypothesis and conclude that the additional covariates significantly improve the model fit.
+The more complex model becomes our new best model benchmark and we move on to the next complexity layer.
 
 ```{r anova_test}
 anova(m_null, m_ex, test = "Chisq")
 ```
 
-## Generalized Linear Models (GLM)
+Note how the residual deviances are aligned with the one we calculated. The `BM_binned` adds two additional dummy variables (as it has three levels with one as the reference category).
+The test statistic is then $D_0 - D_m$ with 2 degrees of freedom. The probability of observing a test statistic at least as extreme as the one calculated under the null hypothesis is given by the p-value from the chi-squared test.
+## GLM Workflow
 
 ```{r glm_workflow}
 
