@@ -2091,7 +2091,13 @@ $$
 The training error can be replaced by the deviance \(D\), which measures the goodness of fit of the model to the training data. The optimism term \(2 Cov(Y_i, \hat{Y}_i)\) can be approximated by the penalty term \(\frac{2(p+1)}{n}\), where \(p\) is the number of parameters and \(n\) is the sample size.
 
 $$
-\text{Prediction error} = D + \frac{2(p+1)}{n}
+\text{Prediction error} = D + \frac{2(p+1)}{n} 
+$$
+
+Therefore, the sum of prediction errors across all observations can be expressed as:
+
+$$
+\text{Total Prediction Error} = \sum_{i=1}^{n} \left( D_i + \frac{2(p+1)}{n} \right) = \sum_{i=1}^{n} D_i + 2(p+1)
 $$
 
 We will also log the deviance and complexity penalty separately to interpret the contribution of each to the overall prediction error.
@@ -2156,7 +2162,16 @@ anova(m_null, m_ex, test = "Chisq")
 
 Note how the residual deviances are aligned with the one we calculated. The `BM_binned` adds two additional dummy variables (as it has three levels with one as the reference category).
 The test statistic is then $D_0 - D_m$ with 2 degrees of freedom. The probability of observing a test statistic at least as extreme as the one calculated under the null hypothesis is given by the p-value from the chi-squared test.
-## GLM Workflow
+## Frequency GLM Workflow
+
+We have already covered the data preparation and performance metrics choice for our workflow. The final decision is the specification of the model formula we will choose.
+We will use the poisson family with a log link function for modeling the frequency of claims because:
+
+- The `NCLAIMS` variable represents count data, which is naturally modeled using a Poisson distribution.
+- The log link function has multiple advantages:
+    - It is the canonical link for the Poisson distribution, ensuring the property of the method of marginal totals (the sum of the fitted values equals the sum of the observed values).
+    - It guarantees that the predicted values are always positive, which is appropriate for count data.
+    - It allows for a multiplicative interpretation of the effects of covariates on the expected count which is easier to understand and communicate to the business.
 
 ```{r glm_workflow}
 
@@ -2169,7 +2184,6 @@ create_wflow_freq_glm <- function(data, formula, v = 5, rec=recipe(NCLAIMS ~ ., 
         strata = NCLAIMS
     )
 
-    # The Poisson family uses a log link by default
     mod <- poisson_reg() %>%
         set_engine("glm")
 
@@ -2183,18 +2197,32 @@ create_wflow_freq_glm <- function(data, formula, v = 5, rec=recipe(NCLAIMS ~ ., 
         control = control_resamples(save_pred = TRUE)
     )
 
-    # Cross-validation does not fit a final model on all the data
+    # Fit the final model on the training data
     final_fit <- fit(wflow, data = data)
     glm_fit <- extract_fit_engine(final_fit)
 
-    # Cross-validated deviance
+    # Compute the cross-validated metrics
     cv_pred <- collect_predictions(cv_results)
-    cv_deviance <- cv_pred %>%
-        mutate(deviance_i = poisson()$dev.resids(y = NCLAIMS, mu = .pred, wt = 1)) %>%
+
+    cv_metrics <- cv_pred %>%
+        mutate(
+            deviance_i = poisson()$dev.resids(
+                y = NCLAIMS, mu = .pred, wt = 1
+            ),
+            log_loss_i = -dpois(
+                NCLAIMS, lambda = .pred, log = TRUE
+            )
+        ) %>%
         summarise(
-            total_deviance = sum(deviance_i),
+            CV_Deviance = sum(deviance_i),
+            CV_LogLoss = mean(log_loss_i)
         )
-    cv_log_loss <- poisson_log_loss(cv_pred, truth = NCLAIMS, estimate = .pred)
+
+    n <- nrow(data)
+    k <- glm_fit$rank  # fitted parameters, including the intercept
+    training_deviance <- cv_metrics$CV_Deviance
+    complexity_penalty <- 2 * k
+    estimated_prediction_error <- training_deviance + complexity_penalty
 
     list(
         workflow = wflow,
@@ -2205,21 +2233,22 @@ create_wflow_freq_glm <- function(data, formula, v = 5, rec=recipe(NCLAIMS ~ ., 
             AIC = AIC(glm_fit),
             BIC = BIC(glm_fit),
             Deviance = deviance(glm_fit),
-            CV_Deviance = cv_deviance$total_deviance,
-            CV_LogLoss = cv_log_loss$.estimate
+            CV_Deviance = cv_metrics$CV_Deviance,
+            CV_Complexity = complexity_penalty,
+            CV_Prediction_Error = estimated_prediction_error,
+            CV_LogLoss = cv_metrics$CV_LogLoss
         )
     )
 }
 ```
 
-We created a workflow to:
+The workflow that we will use for the frequency modelling using GLM(poisson) includes the following steps:
 
-- Make the n folds (5 by default)
-- Add the new levels to a categorical variable "Other", particularly relevant for Municipalities with low frequency
-- Specify the Poisson regression model with a log link
-- Fit the model on the entire training dataset
-- Perform cross-validation to evaluate model performance
-- Store the workflow, cross-validation (Deviance and LogLoss) and final model fit
+1. Specify the 5-fold cross-validation
+2. Specify the Poisson regression model with a log link
+3. Fit the model on the entire training dataset
+4. Perform cross-validation to evaluate cv performance metrics
+5. Return the workflow, fitted model, and performance metrics
 
 This workflow will be used for all models in the frequency analysis, ensuring consistency in model fitting, cross-validation, and performance evaluation.
 
@@ -2227,7 +2256,7 @@ This workflow will be used for all models in the frequency analysis, ensuring co
 
 Let us start with adding the categorical variables only to our frequency model:
 
-- `COVERAGE_BIN`
+- `COVERAGE`
 - `FLEET`
 - `SEX`
 - `FUEL`
@@ -2241,9 +2270,13 @@ perf_metrics_df <- data.frame(
     BIC = numeric(),
     Deviance = numeric(),
     CV_Deviance = numeric(),
-    CV_LogLoss = numeric()
+    CV_Complexity = numeric(),
+    CV_Prediction_Error = numeric(),
+    CV_LogLoss = numeric(),
+    Formula = character()
 )
-append_performance_metrics <- function(name, formula, result, perf_df = perf_metrics_df) {
+
+append_performance_metrics <- function(name, formula,result, perf_df = perf_metrics_df) {
     perf <- result$performance_metrics
     new_row <- data.frame(
         Model = name,
@@ -2251,7 +2284,10 @@ append_performance_metrics <- function(name, formula, result, perf_df = perf_met
         BIC = perf$BIC,
         Deviance = perf$Deviance,
         CV_Deviance = perf$CV_Deviance,
-        CV_LogLoss = perf$CV_LogLoss
+        CV_Complexity = perf$CV_Complexity,
+        CV_Prediction_Error = perf$CV_Prediction_Error,
+        CV_LogLoss = perf$CV_LogLoss,
+        Formula = formula
     )
     rbind(perf_df, new_row)
 }
@@ -2265,7 +2301,7 @@ perf_metrics_df <- append_performance_metrics(name = "Intercept Only", formula =
 rcat <- create_wflow_freq_glm(train_data, fcat)
 perf_metrics_df <- append_performance_metrics(name = "Categorical Only", formula = fcat, result = rcat)
 
-perf_metrics_df %>% arrange(AIC) %>% knitr::kable(
+perf_metrics_df %>% arrange(CV_Prediction_Error) %>% select(-Formula) %>% knitr::kable(
     booktabs = TRUE, caption = "Performance Metrics for Frequency Models After Adding Categorical Variables"
 )
 ```
@@ -2304,7 +2340,7 @@ plot_summary <- function(result, add_text=FALSE) {
             color = ifelse(mult_df$multiplier > 1, "firebrick", "darkgreen")
         ) else NULL} +
         coord_flip() +
-        labs(x = "Coefficient", y = "Multiplier", title = sprintf("Coefficient Multipliers and 95%% CI\nBase Premium: %.2f", exp(result$fit$coefficients[1]))) +
+        labs(x = "Coefficient", y = "Multiplier", title = sprintf("Coefficient Multipliers and 95%% CI\nClaim frequency of the reference category: %.2f", exp(result$fit$coefficients[1]))) +
         theme_minimal()
 }
 coefs <- check_summary(rcat)
@@ -2326,7 +2362,7 @@ The new model is better than the null model and needs no adaptation, so we can c
 base_mod <- rcat
 ```
 
-### Binned Continuous Variables
+### Adding Binned Continuous Variables
 
 Next, we will add the binned continuous variables to our model to capture the potential non-linear effects of continuous predictors on the frequency of claims:
 
@@ -2336,7 +2372,7 @@ Next, we will add the binned continuous variables to our model to capture the po
 - POWER_binned_merged
 
 ```{r binned_continuous_variables}
-fcontb <- paste0(fcat, " + ", paste(binned_continuous_features, collapse = " + "))
+fcontb <- paste0(base_mod, " + ", paste(binned_continuous_features, collapse = " + "))
 cat(sprintf("> Full formula with binned continuous variables: %s", fcontb))
 
 rcontb <- create_wflow_freq_glm(train_data, fcontb)
@@ -2351,47 +2387,31 @@ plot_summary(rcontb)
 
 There are two main takeaways from the analysis of this more complex model:
 
-1. With the addition of binned continuous variables, the `SEXfemale` and `FLEETY` variables are not significant anymore. It suggests that they may have been capturing some of the information that is now explained by the binned continuous variables.
+1. With the addition of binned continuous variables, the `SEXfemale` variable is just barely significant, we can test whether the nested anova test supports its removal from the model.
 2. The binned continuous variables themselves are all significant at the 95% confidence level. The WoE-based binning and merging strategy we applied is therefore effective in capturing significant non-linear effects of continuous predictors on the frequency of claims.
+3. Some coefficients of the binned variables are very similar, we'll consider merging them later for the final model.
 
-```{r non_significant}
-coefs_contb %>% filter(significant == "No") %>%
-    arrange(desc(p.value)) %>%
-    kable(booktabs = TRUE, caption = "Non-significant Coefficients")
-```
+Let's proceed to remove the `SEX` variable from the model and evaluate the impact on model performance.
 
-We will start by removing the `FLEET` [^fleet_remove] variable from the model as it is less significant that the `SEX` variable.
-
-```{r prune_cont_mod_1}
+```{r prune_cont_mod}
 large_mod <- rcontb$fit
-fcontb_p1 <- gsub(" \\+ FLEET", "", fcontb)
-cat(sprintf("> Formula after removing FLEET: %s", fcontb_p1))
+fcontb_rsex <- gsub(" \\+ SEX", "", fcontb)
+cat(sprintf("> Formula after removing SEX: %s", fcontb_rsex))
 
-rcontb_p1 <- create_wflow_freq_glm(train_data, fcontb_p1)
-perf_metrics_df <- append_performance_metrics(name = "Pruned-1 Continuous Binned", formula = fcontb_p1, result = rcontb_p1)
-test_p1 <- anova(large_mod, rcontb_p1$fit, test = "Chisq")
-cat(sprintf("Are we loosing significant explanatory power by removing FLEET? %s (p-value = %.4f)\n", ifelse(test_p1$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_p1$`Pr(>Chi)`[2]))
-coefs_contb_p1 <- check_summary(rcontb_p1)
-plot_summary(rcontb_p1)
-```
-
-Our conclusions hold and we will now proceed to remove the `SEX` variable from the model as it is the other non-significant variable.
-
-```{r prune_cont_mod_2}
-large_mod <- rcontb_p1$fit
-fcontb_p2 <- gsub(" \\+ SEX", "", fcontb_p1)
-cat(sprintf("> Formula after removing SEX: %s", fcontb_p2))
-
-rcontb_p2 <- create_wflow_freq_glm(train_data, fcontb_p2)
-perf_metrics_df <- append_performance_metrics(name = "Pruned-2 Continuous Binned", formula = fcontb_p2, result = rcontb_p2)
-test_p2 <- anova(large_mod, rcontb_p2$fit, test = "Chisq")
+rcontb_rsex <- create_wflow_freq_glm(train_data, fcontb_rsex)
+perf_metrics_df <- append_performance_metrics(name = "Continuous Binned without SEX", formula = fcontb_rsex, result = rcontb_rsex)
+test_p2 <- anova(large_mod, rcontb_rsex$fit, test = "Chisq")
 cat(sprintf("Are we loosing significant explanatory power by removing SEX? %s (p-value = %.4f)\n", ifelse(test_p2$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_p2$`Pr(>Chi)`[2]))
-coefs_contb_p2 <- check_summary(rcontb_p2)
-plot_summary(rcontb_p2)
-base_mod <- rcontb_p2$fit
+coefs_contb_p2 <- check_summary(rcontb_rsex)
+perf_metrics_df %>% arrange(CV_Prediction_Error) %>% select(-Formula) %>% kable(
+    booktabs = TRUE, caption = "Performance Metrics for Frequency Models After Removing SEX"
+)
+base_mod <- rcontb$fit
 ```
 
-After pruning the non-significant variables `FLEET` and `SEX`, our final continuous binned model includes only the significant predictors. This model will serve as the base for the next enrichment steps in our modeling process.
+We see with that based on the prediction error, our best model includes the SEX. The complexity cost of 2 is justified by the reduction in deviance (confirmed by AIC). 
+The anova test also confirms that removing the SEX variable results in a significant loss of explanatory power. Only the BIC criteria favors the simpler model as complexity is penalized more heavily.
+We will keep the SEX variable in our best model benchmark and continue with the next layer of covariates.
 
 ### Enriched Features
 
@@ -2401,10 +2421,10 @@ After including our continuous binned variables, we will now add the new geospat
 - `MUNICIPALITY_binned`
 - `POPULATION_binned`
 
-Because the Municipalities are so small, we will first focus on the two other variables.
+Because the bins in `MUNICIPALITY_binned` are very small, they will not do well with cross-validation, so we will focus on the other two enriched features and then test the impact of including `MUNICIPALITY_binned` without cross-validation.
 
 ```{r enriched_features}
-f_enr2 <- paste0(fcontb_p2, " + REGION_merged + POPULATION_binned")
+f_enr2 <- paste0(base_mod, " + REGION_merged + POPULATION_binned")
 cat(sprintf("> Formula after adding two enriched features: %s", f_enr2))
 r_enr2 <- create_wflow_freq_glm(train_data, f_enr2)
 perf_metrics_df <- append_performance_metrics(name = "Enriched Features", formula = f_enr2, result = r_enr2)
