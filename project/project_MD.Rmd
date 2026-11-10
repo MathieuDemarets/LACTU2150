@@ -50,6 +50,9 @@ if (!require("parsnip")) install.packages("parsnip")
 if (!require("workflows")) install.packages("workflows")
 if (!require("poissonreg")) install.packages("poissonreg")
 if (!require("rlang")) install.packages("rlang")
+if (!require("mgcv")) install.packages("mgcv")
+if (!require("parallel")) install.packages("parallel")
+if (!require("maps")) install.packages("maps")
 
 library(dplyr)
 library(forcats)
@@ -69,7 +72,14 @@ library(parsnip)
 library(workflows)
 library(poissonreg)
 library(rlang)
+library(mgcv)
+library(parallel)
+library(maps)
 
+setwd(paste0(
+    "C:/Users/MathieuDemarets/Documents/UCL Certificat/",
+    "CodeRepositories/LACTU2150/project"
+))
 ```
 
 # Executive Summary
@@ -114,10 +124,6 @@ As we will explain in the "Approach" section of this Introduction chapter, we wi
 ### Records (Rows)
 
 ```{r portfolio_overview}
-setwd(paste0(
-    "C:/Users/MathieuDemarets/Documents/UCL Certificat/",
-    "CodeRepositories/LACTU2150/project"
-))
 load("../data/mtpl_be.rda")
 data <- mtpl_be
 
@@ -1823,6 +1829,14 @@ rm(list = setdiff(ls(), c(
     functions)))
 cat(sprintf("Remaining objects and functions: %s", paste(ls(), collapse = ", ")))
 
+# Save remaining objects for modelling
+save(list = ls(), file = "../data/modelling_objects.RData")
+```
+
+
+```{r start_modelling}
+load("../data/modelling_objects.RData")
+
 original_categorical_features <- c("COVERAGE", "FUEL", "FLEET", "SEX")
 continuous_features <- c("BM", "AGEPH", "AGEC", "POWER")
 binned_continuous_features <- c("BM_binned", "AGEPH_binned_merged", "AGEC_binned", "POWER_binned_merged")
@@ -2001,7 +2015,7 @@ data_preparation_recipe <- function(input_data) {
         )
 
     # Set factor levels based on predefined levels_named_list and ensure they are unordered and with the correct reference level
-    for (col in factor_features) {
+    for (col in c(factor_features, "REGION_merged", "MUNICIPALITY_binned", "POPULATION_binned")) {
         feature_levels <- levels_named_list[[col]]
         if (is.null(feature_levels) || length(feature_levels) == 0) {
             stop(sprintf("Factor levels are missing for column %s", col))
@@ -2146,6 +2160,7 @@ data.frame(
     caption = "Example Deviance and Log-Likelihood for Nested Models",
     booktabs = TRUE
 )
+rm(ll_null, ll_ex, d_null, d_ex, ll_sat, d_sat, calc_d_null, calc_d_ex)
 ```
 
 The Chi-squared anova test will be comparing the difference of the deviance of the nested models to evaluate whether the addition of new covariates significantly improves the model fit:
@@ -2158,10 +2173,12 @@ The more complex model becomes our new best model benchmark and we move on to th
 
 ```{r anova_test}
 anova(m_null, m_ex, test = "Chisq")
+rm(m_null, m_ex)
 ```
 
 Note how the residual deviances are aligned with the one we calculated. The `BM_binned` adds two additional dummy variables (as it has three levels with one as the reference category).
 The test statistic is then $D_0 - D_m$ with 2 degrees of freedom. The probability of observing a test statistic at least as extreme as the one calculated under the null hypothesis is given by the p-value from the chi-squared test.
+
 ## Frequency GLM Workflow
 
 We have already covered the data preparation and performance metrics choice for our workflow. The final decision is the specification of the model formula we will choose.
@@ -2226,8 +2243,6 @@ create_wflow_freq_glm <- function(data, formula, v = 5, rec=recipe(NCLAIMS ~ ., 
 
     list(
         workflow = wflow,
-        folds = folds,
-        resamples = cv_results,
         fit = glm_fit,
         performance_metrics = list(
             AIC = AIC(glm_fit),
@@ -2360,6 +2375,7 @@ The new model is better than the null model and needs no adaptation, so we can c
 
 ```{r reassign_rcat}
 base_mod <- rcat
+base_f <- fcat
 ```
 
 ### Adding Binned Continuous Variables
@@ -2372,20 +2388,20 @@ Next, we will add the binned continuous variables to our model to capture the po
 - POWER_binned_merged
 
 ```{r binned_continuous_variables}
-fcontb <- paste0(base_mod, " + ", paste(binned_continuous_features, collapse = " + "))
+fcontb <- paste0(base_f, " + ", paste(binned_continuous_features, collapse = " + "))
 cat(sprintf("> Full formula with binned continuous variables: %s", fcontb))
 
 rcontb <- create_wflow_freq_glm(train_data, fcontb)
 perf_metrics_df <- append_performance_metrics(name = "All Continuous Binned", formula = fcontb, result = rcontb)
 
-test <- anova(rcat$fit, rcontb$fit, test = "Chisq")
+test <- anova(base_mod$fit, rcontb$fit, test = "Chisq")
 cat(sprintf("Is the full model with binned continuous variables a significant improvement over the categorical model? %s (p-value = %.4f)\n", ifelse(test$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test$`Pr(>Chi)`[2]))
 
 coefs_contb <- check_summary(rcontb)
 plot_summary(rcontb)
 ```
 
-There are two main takeaways from the analysis of this more complex model:
+There are three main takeaways from the analysis of this more complex model:
 
 1. With the addition of binned continuous variables, the `SEXfemale` variable is just barely significant, we can test whether the nested anova test supports its removal from the model.
 2. The binned continuous variables themselves are all significant at the 95% confidence level. The WoE-based binning and merging strategy we applied is therefore effective in capturing significant non-linear effects of continuous predictors on the frequency of claims.
@@ -2406,7 +2422,8 @@ coefs_contb_p2 <- check_summary(rcontb_rsex)
 perf_metrics_df %>% arrange(CV_Prediction_Error) %>% select(-Formula) %>% kable(
     booktabs = TRUE, caption = "Performance Metrics for Frequency Models After Removing SEX"
 )
-base_mod <- rcontb$fit
+base_f <- fcontb
+base_mod <- rcontb
 ```
 
 We see with that based on the prediction error, our best model includes the SEX. The complexity cost of 2 is justified by the reduction in deviance (confirmed by AIC). 
@@ -2424,11 +2441,11 @@ After including our continuous binned variables, we will now add the new geospat
 Because the bins in `MUNICIPALITY_binned` are very small, they will not do well with cross-validation, so we will focus on the other two enriched features and then test the impact of including `MUNICIPALITY_binned` without cross-validation.
 
 ```{r enriched_features}
-f_enr2 <- paste0(base_mod, " + REGION_merged + POPULATION_binned")
+f_enr2 <- paste0(base_f, " + REGION_merged + POPULATION_binned")
 cat(sprintf("> Formula after adding two enriched features: %s", f_enr2))
 r_enr2 <- create_wflow_freq_glm(train_data, f_enr2)
 perf_metrics_df <- append_performance_metrics(name = "Enriched Features", formula = f_enr2, result = r_enr2)
-test_enr2 <- anova(base_mod, r_enr2$fit, test = "Chisq")
+test_enr2 <- anova(base_mod$fit, r_enr2$fit, test = "Chisq")
 cat(sprintf("Are we gaining significant explanatory power by adding enriched features? %s (p-value = %.4f)\n", ifelse(test_enr2$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_enr2$`Pr(>Chi)`[2]))
 coefs_enr2 <- check_summary(r_enr2)
 plot_summary(r_enr2)
@@ -2437,9 +2454,8 @@ plot_summary(r_enr2)
 We notice that the `REGION_merged` and `POPULATION_binned` variables contribute significantly to the model, it was therefore worth including them as enriched features in our final model.
 
 - `REGION_mergedBrussels` is actually the second highest multiplier of claim frequency in the model: `r coefs_enr2["REGION_mergedBrussels", "multiplier"]` (95% CI: `r coefs_enr2["REGION_mergedBrussels", "multiplier_lb"]` - `r coefs_enr2["REGION_mergedBrussels", "multiplier_ub"]`)
-- `POPULATION_binned(1.34e+05,4.53e+05]`, so high population also stand out as third biggest multiplier of claim frequency in the model: `r coefs_enr2["POPULATION_binned(1.34e+05,4.53e+05]", "multiplier"]` (95% CI: `r coefs_enr2["POPULATION_binned(1.34e+05,4.53e+05]", "multiplier_lb"]` - `r coefs_enr2["POPULATION_binned(1.34e+05,4.53e+05]", "multiplier_ub"]`)
+- The two largest bins in `POPULATION_binned` have significant but similar coefficients, we will also consider merging them in the final model section.
 
-Note that the largest multiplier of claim frequency is actually an experience-related variable, it should not be available for a-priori pricing. Therefore the enriched features we added are the most relevant for improving the a-priori model.
 Finally, let's have a quick look at the `MUNICIPALITY_binned` variable to see if it can add anything to the urban and population density we already considered.
 Note that we won't use our workflow because the bins are too small and we will run into issues with non-observed levels in the cross-validation folds.
 We'll make a single GLM fit to test our hypothesis.
@@ -2453,15 +2469,44 @@ test_enr3 <- anova(r_enr2$fit, r_enr3$fit, test = "Chisq")
 cat(sprintf("Does MUNICIPALITY_binned add significant explanatory power? %s (p-value = %.4f)\n", ifelse(test_enr3$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_enr3$`Pr(>Chi)`[2]))
 coefs_enr3 <- check_summary(r_enr3)
 plot_summary(r_enr3)
-base_mod <- r_enr2$fit
+# base_mod <- r_enr2$fit
 ```
 
-Even if the more complex MUNICIPALITY_binned variable adds some explanatory power, we see that individual municipalities do not have a significant impact on claim frequency (multiplier close to 1).
-We will therefore not include `MUNICIPALITY_binned` in our final model.
+The interpretation of the `MUNICIPALITY_binned` effect on the model is difficult. We first see that the effet of La Louvière, Charleroi, and Anvers are not significant. Only Mons is significant but barely.
+What is more interesting to notice is that we only have four out of the six original municipalities. This is because of `collinearity`. As we explained in the feature engineering section, adding similar views of the geographical location yields redundant information and the model automatically drops some levels to avoid perfect multicollinearity.
+We can dive deeper in this issue with the `alias` function in R, which shows which coefficients are linearly dependent and therefore dropped from the model.
+
+```{r alias_municipality}
+alias_mat <- alias(r_enr3$fit)$Complete
+alias_mat[, colSums(abs(alias_mat)) > 0] %>% kable(
+    caption = "Alias matrix for MUNICIPALITY_binned"
+)
+```
+
+Taking the example of Gand, this means that we know the policyholder lived in Gand in 1997 because he live in a municipality with a population between 20500 and 45300 people that is not Anvers.
+We can prove that by filtering our training data based on these criteria:
+
+```{r filter_gand}
+train_data %>%
+  filter(POPULATION_binned == "(2.05e+05,4.53e+05]", MUNICIPALITY_binned != "Anvers") %>%
+  select(MUNICIPALITY_binned) %>%
+  unique() %>%
+  kable(
+    caption = "MUNICIPALITY_binned values for the filtered criteria"
+  )
+```
+
+Even if adding the `MUNICIPALITY_binned` variable to the model adds some explanatory power, it creates multicollinearity issues and provides a single, barely interpretable coefficient for Mons.
+We will therefore not include the `MUNICIPALITY_binned` variable in our best model and continue with only the two other features.
+
+```{r base_model_after_enriched}
+base_f <- f_enr2
+base_mod <- r_enr2
+```
 
 ### Interaction Effects
 
-To close this GLM estimation chapter for the claim frequency model, we will include the interaction effects we identified with the decision tree analysis.
+The final complexity layer for this GLM estimation chapter for the claim frequency model is to include the interaction effects we identified with the decision tree analysis.
 
 - `BM_binned` x `AGEPH_binned_merged`
 - `REGION_merged` x `POWER_binned_merged`
@@ -2473,28 +2518,48 @@ The interaction based on expert knowledge will also be considered:
 
 - `AGEPH_binned_merged` x `POWER_binned_merged`
 
-Because interactions will create very small cross sections, we'll skip cross validation and use GLM straightaway.
+Because interactions will create very small cross sections, we'll skip cross validation and use a single GLM estimation.
 
 ```{r interactions}
-f_sp_int <- paste0(f_enr2, " + ", paste(interaction_features, collapse = " + "))
+f_int <- paste0(base_f, " + ", paste(interaction_features, collapse = " + "))
+cat(sprintf("> Formula after adding specific interaction: %s", f_int))
+r_int <- list()
+r_int$fit <- glm(as.formula(f_int), data = train_data, family = poisson())
+test_int <- anova(base_mod$fit, r_int$fit, test = "Chisq")
+cat(sprintf("Are we gaining significant explanatory power by adding interactions? %s (p-value = %.4f)\n", ifelse(test_int$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_int$`Pr(>Chi)`[2]))
+coefs_int <- check_summary(r_int)
+plot_summary(r_int)
+```
+
+Note that even if the interactions add some explanatory power, they make the model more complex, less stable, and harder to interpret.
+The region Brussels for example does not have a significant effect anymore as it is included in the interaction terms and confounded with other variables.
+Besides, only the specific BM between 1 and 11 x Brussels Region has a significant effect on claim frequency.
+We can focus on the two specific interactions only to see if we can have a more interpretable and stable model.
+
+```{r interactions_specific}
+f_sp_int <- paste0(base_f, " + BM_01_FUEL_not_gasoline + BM_01_FUEL_gasoline")
 cat(sprintf("> Formula after adding specific interaction: %s", f_sp_int))
 r_sp_int <- list()
 r_sp_int$fit <- glm(as.formula(f_sp_int), data = train_data, family = poisson())
-test_sp_int <- anova(base_mod, r_sp_int$fit, test = "Chisq")
+test_sp_int <- anova(base_mod$fit, r_sp_int$fit, test = "Chisq")
 cat(sprintf("Are we gaining significant explanatory power by adding interactions? %s (p-value = %.4f)\n", ifelse(test_sp_int$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_sp_int$`Pr(>Chi)`[2]))
 coefs_sp_int <- check_summary(r_sp_int)
 plot_summary(r_sp_int)
 ```
 
-Note that even if the interactions add some explanatory power, they make the model more complex, less stable, and harder to interpret.
-Besides, only the specific BM between 1 and 11 x Brussels Region has a significant effect on claim frequency.
-We will therefore not include the interaction terms in our final model.
+The `BM_01_FUEL_gasoline` = True is a linear combination of other covariates that are present in the model and is excluded due to perfect multicollinearity.
+The other specific interaction `BM_01_FUEL_not_gasoline` = True is not significant. We will therefore not include these specific interactions either.
+Based on this complexity layer approach, we can select the enriched model as our best model as far. In the last part of this GLM modeling, we will summarize the performance metrics and prune the best model for similar coefficients.
 
-### Summary of Performance Metrics and Final GLM Model
+### Selection of the Best Model
 
 We can close the GLM frequency model estimation here by looking at the evolution of our performance metrics across the different modeling stages:
 
 ```{r performance_metrics}
+
+perf_metrics_df %>% arrange(CV_Prediction_Error) %>% select(-Formula) %>% kable(
+    booktabs = TRUE, caption = "Final Leaderboard ordered by CV Prediction Error"
+)
 plot_leaderboard <- function(data, metric, title, digits = 2) {
 
     plot_data <- data %>%
@@ -2539,9 +2604,9 @@ plot_leaderboard <- function(data, metric, title, digits = 2) {
 
 p1 <- plot_leaderboard(perf_metrics_df, "AIC", "AIC")
 p2 <- plot_leaderboard(perf_metrics_df, "BIC", "BIC")
-p3 <- plot_leaderboard(perf_metrics_df, "CV_Deviance", "CV deviance")
+p3 <- plot_leaderboard(perf_metrics_df, "CV_Prediction_Error", "CV Prediction Error")
 p4 <- plot_leaderboard(
-    perf_metrics_df, "CV_LogLoss", "CV Poisson log loss", digits = 4
+    perf_metrics_df, "CV_LogLoss", "CV Log Loss", digits = 4
 )
 
 (p1 | p2) / (p3 | p4) +
@@ -2552,22 +2617,173 @@ p4 <- plot_leaderboard(
 ```
 
 Based on this leaderboard, we can confirm that our final model with categorical, significant binned continuous features and significant enriched features performs the best across all evaluated metrics.
-The other models have the same ranking across AIC, cross-validated deviance, and cross-validated Poisson log loss. The only difference we noticed is in the BIC metric that penalizes more model complexity.
-For the three models with continuous features, this penalization difference is sufficient to alter their ranking and favor the simpler models.
+The other models have the same ranking across AIC, cross-validated prediction error, and cross-validated Poisson log loss. The only difference we noticed is in the BIC metric that penalizes more model complexity.
+The penalisation coefficient is sufficiently large to prefer the model with continuous bins without sex to the one with sex included.
+
+Now that we have identified the best-performing model, can we proceed to merge levels with similar effects without losing predictive power?
+
+```{r merge_levels}
+plot_summary(base_mod)
+```
+
+Visual inspection points towards the following potential merges:
+
+1. `POPULATION_binned`: (1.34e+05,2.05e+05] and (2.05e+05,4.53e+05]
+2. `COVERAGE`: PO and FO under OM for omnium
+3. `POWER_binned`: (47-51] and (51-76]
+
+We will adapt the recipe in our workflow to implement these potential merges and evaluate their impact on model performance one by one.
+
+```{r potential_merges_population}
+rec_pop <- recipe(NCLAIMS ~ ., data = train_data) %>%
+    step_mutate(
+        POPULATION_binned = fct_collapse(POPULATION_binned,
+            "(1.34e+05,4.53e+05]" = c("(1.34e+05,2.05e+05]", "(2.05e+05,4.53e+05]")
+        )
+    )
+r_mpop <- create_wflow_freq_glm(train_data, base_f, rec = rec_pop)
+perf_metrics_df <- append_performance_metrics(name = "Merged POPULATION_binned", formula = base_f, result = r_mpop)
+test_mpop <- anova(base_mod$fit, r_mpop$fit, test = "Chisq")
+cat(sprintf("Are we gaining significant explanatory power by keeping the levels separate? %s (p-value = %.4f)\n", ifelse(test_mpop$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_mpop$`Pr(>Chi)`[2]))
+```
+
+Merging the `POPULATION_binned` levels (1.34e+05,2.05e+05] and (2.05e+05,4.53e+05] into a single level (1.34e+05,4.53e+05] allows us to simplify the model without losing significant explanatory power, as indicated by the p-value from the likelihood ratio test.
+Let's proceed with the coverage variable. We already identified in the data exploration that the `PO` and `FO` could potentially be merged under the `OM` level for omnium coverage.
+
+```{r potential_merges_coverage}
+base_mod <- r_mpop
+rec_cov <- rec_pop %>%
+    step_mutate(
+        COVERAGE = fct_collapse(COVERAGE,
+            "OM" = c("PO", "FO")
+        )
+    )
+r_mcov <- create_wflow_freq_glm(train_data, base_f, rec = rec_cov)
+perf_metrics_df <- append_performance_metrics(name = "Merged COVERAGE", formula = base_f, result = r_mcov)
+test_mcov <- anova(base_mod$fit, r_mcov$fit, test = "Chisq")
+cat(sprintf("Are we gaining significant explanatory power by keeping the COVERAGE levels separate? %s (p-value = %.4f)\n", ifelse(test_mcov$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_mcov$`Pr(>Chi)`[2]))
+```
+
+Again, merging the `COVERAGE` levels `PO` and `FO` into a single `OM` level simplifies the model without a significant loss of explanatory power, as indicated by the p-value from the likelihood ratio test.
+Let's continue with our third and last potential merge for the `POWER_binned` variable.
+
+```{r potential_merges_power}
+base_mod <- r_mcov
+rec_pow <- rec_cov %>%
+    step_mutate(
+        POWER_binned_merged = fct_collapse(POWER_binned_merged,
+            "(47,76]" = c("(47,51]","(51,76]")
+        )
+    )
+r_mpow <- create_wflow_freq_glm(train_data, base_f, rec = rec_pow)
+perf_metrics_df <- append_performance_metrics(name = "Merged POWER_binned", formula = base_f, result = r_mpow)
+test_mpow <- anova(base_mod$fit, r_mpow$fit, test = "Chisq")
+cat(sprintf("Are we gaining significant explanatory power by keeping the POWER_binned levels separate? %s (p-value = %.4f)\n", ifelse(test_mpow$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_mpow$`Pr(>Chi)`[2]))
+```
+
+It seems that all merges make sense. Let's visualize the performance and coefficients of our final best GLM model.
+
+```{r final_glm_visualization}
+base_mod <- r_mpow
+base_rec <- rec_pow
+
+plot_summary(base_mod)
+perf_metrics_df %>% arrange(CV_Prediction_Error) %>% select(-Formula) %>% kable(
+    booktabs = TRUE, caption = "Final Leaderboard after levels merging ordered by CV Prediction Error"
+)
+```
+
+Our final best GLM model is the simplified one with merged `COVERAGE`, `POWER_binned` and `POPULATION_levels`.
+The CV Complexity obviously favors this simplified model, but even the cross-validated deviance and log loss are slightly better which indicates that the model generalizes better.
+We will take this model as the base for our subsequent GAM exploration.
+
 
 <br>
 
-## Generalized Additive Models (GAM)
+## Frequency GAM Workflow
 
-<br>
+With our best GLM model as basis, we will explore whether incorporating smoothed terms for continuous variables instead of using bins can improve model performance.
 
-### Manual Backfitting for Latitude and Longitude
+### Smoothing Example for Spatial Effect
 
-Illustrate the GAM logic by alternately updating the latitude and longitude effects while holding the other model components fixed.
+To illustrate the power of smoothing, we will compare the coefficients and significance of `LONG` in `LAT` when used in a GLM versus a GAM.
+Note that in the GAM[^bam], we will use the bivariate smooth term `s(LONG, LAT)` to capture the spatial effect and not the tensor product smooth `te(LONG, LAT)` becayse the two variables have the same units (isotropic).
 
-<br>
+[^bam]: The `bam` function from the `mgcv` package is used to fit generalized additive models with potentially large datasets efficiently, utilizing parallel computation when specified.
 
-### Adding Enriched Features and Continuous Variables
+```{r smoothing_example}
+glm_long_lat <- glm(NCLAIMS ~ offset(log(EXP)) + LONG + LAT, data = train_data, family = poisson())
+summary(glm_long_lat)$coefficients %>% kable(
+    booktabs = TRUE, caption = "GLM Coefficients for LONG and LAT"
+)
+
+cl <- makeCluster(detectCores() - 1)
+bam_freq_long_lat <- bam(NCLAIMS ~ offset(log(EXP)) + s(LONG, LAT), data = train_data, family = poisson(), cluster = cl)
+stopCluster(cl)
+summary(bam_freq_long_lat)$s.table %>%
+    kable(
+        booktabs = TRUE,
+        caption = "Approximate significance of spatial smooth"
+    )
+
+vis.gam(
+    bam_freq_long_lat, view = c("LONG", "LAT"), plot.type = "contour", type="response",
+    main = "Predicted Frequency in Belgium", cond = list(EXP = 1)
+)
+maps::map("world", regions = "Belgium", add = TRUE, col = "white", lwd = 2)
+points(
+    x = c(4.3517, 5.5797),
+    y = c(50.8503, 50.6326),
+    col = "red", pch = 19, cex = 1.2
+)
+text(
+    x = c(4.3517, 5.5797),
+    y = c(50.8503, 50.6326),
+    labels = c("Brussels", "Liège"),
+    pos = 3, col = "red", cex = 0.9
+)
+```
+
+From a statistical perspective, the GAM yields a far more significant predictor with the spatial smooth term `s(LONG, LAT)` compared to the individual coefficients for `LONG` (not even significant) and `LAT` in the GLM.
+But more importantly, the non-linear spatial effect can be visualized and interpreted, showing for example that frequency is a lot higher around Brussels (as we see with the `REGION` variable in the GLM) and close to Liège.
+When adding this smooth term to the model, we can guess that the predictive power of the variable `REGION_merged` will decrease, as the sur-frequency around the capital is already captured by the spatial smooth term.
+It is also lower in rural parts of the country namely in the Ardennes and other sparsely populated areas.
+
+```{r bam_sev_long_lat}
+## The Spatial Effect for Severity are non-significant, this might be due to the small number of claims
+## We removed the plot from the report as it would take space for little added value
+# cl <- makeCluster(detectCores() - 1)
+# bam_sev_long_lat_avg <- bam(
+#     AVG ~ s(LONG, LAT), data = train_data, family = Gamma(link = "log"), 
+#     subset = NCLAIMS > 0, weights = NCLAIMS, 
+#     cluster = cl
+# )
+# bam_sev_long_lat_amount <- bam(
+#     AMOUNT ~ offset(NCLAIMS) + s(LONG, LAT), data = train_data, family = Gamma(link = "log"), 
+#     subset = NCLAIMS > 0, weights = NCLAIMS, 
+#     cluster = cl
+# )
+# stopCluster(cl)
+
+# vis.gam(
+#     bam_sev_long_lat_avg, view = c("LONG", "LAT"), plot.type = "contour", type="response",
+#     main = "Predicted Severity in Belgium", cond = list(EXP = 1)
+# )
+# map("world", regions = "Belgium", add = TRUE, col = "white", lwd = 2)
+# points(
+#     x = c(4.3517, 5.5797),
+#     y = c(50.8503, 50.6326),
+#     col = "red", pch = 19, cex = 1.2
+# )
+# text(
+#     x = c(4.3517, 5.5797),
+#     y = c(50.8503, 50.6326),
+#     labels = c("Brussels", "Liège"),
+#     pos = 3, col = "red", cex = 0.9
+# )
+```
+
+### Smooth Terms for Continuous Variables
 
 Use the categorical-only frequency GLM as the baseline, then add enriched features and smooth terms for continuous variables.
 
