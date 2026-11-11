@@ -215,7 +215,7 @@ From this basic overview, we can note that:
 - Categorical variables are currently represented as character and integers, they will be later converted to factor variables.
 - `PC` and `TOWN` have too many levels (`r all_vars["PC","Unique"]` and `r all_vars["TOWN","Unique"]` respectively) and will have to be transformed to be usable. They also seem to indicate the same geographical information.
 - `EXP` has `r all_vars["EXP","Unique"]` unique values which indicates that claims happened over all possible days in a year.
-- The average claim `AMOUNT` (`r all_vars["AMOUNT","Center"]`) is not equal to the average `AVG` (`r all_vars["AVG","Center"]`). We will explore this further next because the Center values should be adjusted for the exposure `EXP`.
+- The average claim `AMOUNT` (`r all_vars["AMOUNT","Center"]`) includes zero claims policies whereas the average `AVG` (`r all_vars["AVG","Center"]`) does not and is therefore higher. These raw averages are not the correct metrics as the correct measure should account for the number of claims and not of the number of policies: $\frac{\sum_i AMOUNT_i}{\sum_i NCLAIMS_i}$.
 
 <br>
 
@@ -228,7 +228,7 @@ It is important to keep in mind that exposure is the unit of risk and not the nu
 If we denote the number of claims by `NCLAIMS`, the exposure by `EXP`, then the claim frequency $\hat{\lambda}$ (the expected number of claims per unit of exposure) is given by:
 
 $$
-\hat{\lambda} = \frac{\sum_{i=1}^{n} NCLAIMS_i}{\sum_{i=1}^{n} EXP_i} \leq \frac{\sum_{i=1}^{n} NCLAIMS_i}{n}
+\hat{\lambda} = \frac{\sum_{i=1}^{n} NCLAIMS_i}{\sum_{i=1}^{n} EXP_i} \geq \frac{\sum_{i=1}^{n} NCLAIMS_i}{n}
 $$
 
 In the dataset, about `r 1-round(sum(data$EXP == 1) / nrow(data), 2)` of the policies have an exposure less than 1, it is therefore important to account for the actual exposure when estimating the claim frequency.
@@ -241,15 +241,19 @@ se_mean <- sqrt(correct_lambda / sum(data$EXP))
 ic_99 <- correct_lambda + c(-1, 1) * qnorm(0.995) * se_mean
 
 cat(sprintf(
-    "Correct mean claim frequency is %.3f%% (99%% CI: [%.3f%%, %.3f%%]) and not the naive mean %.3f%%",
-    correct_lambda * 100,
-    ic_99[1] * 100,
-    ic_99[2] * 100,
-    naive_lambda * 100
+    paste0(
+        "Estimated annual claim rate: %.5f claims per policy-year ",
+        "(99%% CI: [%.5f, %.5f]); ",
+        "naive mean count: %.5f claims per observed policy."
+    ),
+    correct_lambda,
+    ic_99[1],
+    ic_99[2],
+    naive_lambda
 ))
 ```
 
-We confirm numerically that the naive mean of `NCLAIMS` underestimates the true claim frequency as it falls short of the 99% confidence interval[^ic] for the correct mean claim frequency. It is therefore important to account for the exposure through the offset[^offset] in the frequency modelling.
+We confirm numerically that the naive mean of `NCLAIMS` underestimates the exposure-adjusted annual rate estimate as it falls short of the 99% confidence interval[^ic] for the correct mean claim frequency. It is therefore important to account for the exposure through the offset[^offset] in the frequency modelling.
 
 [^offset]: In frequency modelling, the exposure is typically included as an offset in the model to adjust for the varying lengths of policy coverage. This ensures that the estimated claim frequency accurately reflects the risk per unit of exposure rather than per policy.
 [^ic]: If we assume a poisson distribution for the number of claims, we'll show in the data exploration section that the standard error of the claim frequency can be estimated as $ \sqrt{\frac{\hat{\lambda}}{\sum_{i=1}^{n} EXP_i}} $.
@@ -258,10 +262,15 @@ We confirm numerically that the naive mean of `NCLAIMS` underestimates the true 
 
 #### Deep Dive into Target Variables (`NCLAIMS`, `AVG`, `AMOUNT` )
 
-The expected cost of claims can be decomposed into the expected frequency of claims and the expected severity of claims. The expected total claim cost $\pi$ can be expressed in terms of the expected frequency $\lambda$ and the expected severity $\mu$ as:
+The expected cost of claims for the policy $i$can be decomposed into the expected frequency of claims and the expected severity of claims. With the following:
+
+- $\pi(x)$: expected total claim cost for policy $i$
+- $\lambda(x)$: expected policy-year claim frequency for policy $i$
+- $e$: exposure for policy in years $i$
+- $\mu(x)$: expected claim severity for policy $i$
 
 $$
-\pi(x) = \lambda(x) \cdot \mu(x)
+\pi(x) = \left(e \cdot \lambda(x)\right) \cdot \mu(x)
 $$
 
 This split is useful to isolate the effects of explanatory variables on the likehood of claims occurring ($\lambda(x)$) from the impact of that claim occurring ($\mu(x)$)[^credit_parallel]. 
@@ -269,11 +278,11 @@ The mitigation strategies are also different depending on whether we aim to redu
 
 [^credit_parallel]: Similar decomposition are done in business with `Impact-Likelihood` matrices or in credit risk modelling with `Probability of Default` and `Loss Given Default`.
 
-For our training dataset[^training], the empirical expected total claim cost can be decomposed into the product of the empirical expected claim frequency and the empirical expected claim severity:
+For our training dataset[^training], the empirical expected total claim cost over one policy-year can be decomposed into the product of the empirical expected claim frequency and the empirical expected claim severity:
 
 $$
 \frac{\sum_{i=1}^{n} AMOUNT_i}{\sum_{i=1}^{n} EXP_i} = \frac{\sum_{i=1}^{n} NCLAIMS_i}{\sum_{i=1}^{n} EXP_i} \cdot \frac{\sum_{i=1}^{n} AMOUNT_i}{\sum_{i=1}^{n} NCLAIMS_i}
-\text{where } \frac{\sum_{i=1}^{n} AMOUNT_i}{\sum_{i=1}^{n} NCLAIMS_i} = AVG_i
+\text{where } \frac{AMOUNT_i}{NCLAIMS_i} = AVG_i
 $$
 
 ```{r global_portfolio}
@@ -281,8 +290,19 @@ sum_exp <- sum(data$EXP)
 sum_nclaims <- sum(data$NCLAIMS)
 sum_amount <- sum(data$AMOUNT)
 
-cat(sprintf("Expected Total Claim Cost: %.2f = %.2f * %.2f", sum_amount / sum_exp, sum_nclaims / sum_exp, sum_amount / sum_nclaims))
-cat(sprintf("With sum_amount = %.2f, sum_nclaims = %.2f, sum_exp = %.2f", sum_amount, sum_nclaims, sum_exp))
+cat(sprintf(
+    paste0(
+        "Empirical annual claim cost: %.2f EUR per policy-year",
+        " = %.5f claims per policy-year * %.2f EUR per claim\n"
+    ),
+    sum_amount / sum_exp,
+    sum_nclaims / sum_exp,
+    sum_amount / sum_nclaims
+))
+cat(sprintf(
+    "Totals: claim amount = %.2f EUR, claims = %.0f, exposure = %.2f policy-years\n",
+    sum_amount, sum_nclaims, sum_exp
+))
 ```
 
 [^training]: Remember that the global portfolio was split to keep a holdout dataset of 20% for validation.
@@ -321,15 +341,11 @@ p_n_claims | p_avg
 ```
 
 For the number of claims, we observe a clear imbalance in the data with `r round(100 * sum(data$NCLAIMS == 0)/nrow(data), 2)`% of the policies having no claims.
-This is quite typical in insurance data, where many policies have no claims or very low average claim costs. We could tackle this data imbalance with dedicated techniques such as:
+This is quite typical in insurance data, where many policies have no claims or very low average claim costs. More generally, count data with a low rate naturally generate a lot of zero-count observations.
+There is no need to implement a special imbalance handling technique such as synthetic oversampling (e.g., SMOTE) or a hurdle model (prediction of zero vs non-zero counts).
 
-- Synthetic oversampling techniques (e.g., SMOTE) create synthetic samples for the minority class to balance the dataset.
-- Hurdle models can be employed to separately model the zero and non-zero counts, effectively handling the excess zeros in the data and focusing on the non-zero records in the second part of the model.
-
-These techniques will however break the adequation between the observed frequency and the modeled frequency which is an important benefit of the modeling approach that we will present in the next section.
-We will therefore not apply these techniques in this analysis.
-
-For policies with claims, we look at the log of the average claim cost to better understand the distribution of claim severity in terms of magnitude. We observe two peaks and a long right tail. This shows that the average claim cost we computed above actually hides very different types of claims:
+For policies with claims, we look at the log of the average claim cost to better interpret the distribution of claim severity in terms of magnitude. 
+We observe two peaks and a long right tail in the histogram. This shows that the average claim cost we computed above actually hides very different types of claims that we can interpret as follows:
 
 - First peak corresponds to small dents and repairs: the log around 5 represents claims of approximately `r sprintf("%.0f euros", exp(5))`
 - Second peak corresponds to more significant repairs: the log around 7.5 represents claims of approximately `r sprintf("%.0f euros", exp(7.5))`
@@ -365,8 +381,9 @@ Here is an overview of the main steps we will follow to achieve this goal:
         - Enriched features added (fit, prune, and test)
         - Interactions added (fit, prune, and test)
         - Summarize the cross-validated prediction error, deviance, and log loss to select the best model (one per layer of complexity)
+        - Merge levels with similar effects to simplify the model and improve interpretability
     - *Generalized Additive Models (GAM) - Poisson(log)*
-        - Show the GAM logic through manual backfitting for latitude and longitude variables
+        - Show the GAM logic through bivariate smoothing for latitude and longitude variables
         - Take the model from the categorical variables only layer as the baseline, add enriched features and continuous variables and fit, prune, and test the model
         - Vizualise the smoothed functions for continuous variables and compare them to the binned numerical variable effects and polynomial transformations
     - *Final Frequency Model*
@@ -2247,7 +2264,6 @@ create_wflow_freq_glm <- function(data, formula, v = 5, rec=recipe(NCLAIMS ~ ., 
         performance_metrics = list(
             AIC = AIC(glm_fit),
             BIC = BIC(glm_fit),
-            Deviance = deviance(glm_fit),
             CV_Deviance = cv_metrics$CV_Deviance,
             CV_Complexity = complexity_penalty,
             CV_Prediction_Error = estimated_prediction_error,
@@ -2283,7 +2299,6 @@ perf_metrics_df <- data.frame(
     Model = character(),
     AIC = numeric(),
     BIC = numeric(),
-    Deviance = numeric(),
     CV_Deviance = numeric(),
     CV_Complexity = numeric(),
     CV_Prediction_Error = numeric(),
@@ -2297,7 +2312,6 @@ append_performance_metrics <- function(name, formula,result, perf_df = perf_metr
         Model = name,
         AIC = perf$AIC,
         BIC = perf$BIC,
-        Deviance = perf$Deviance,
         CV_Deviance = perf$CV_Deviance,
         CV_Complexity = perf$CV_Complexity,
         CV_Prediction_Error = perf$CV_Prediction_Error,
@@ -2330,9 +2344,12 @@ diff_degree_of_freedom <- r0$fit$df.residual - rcat$fit$df.residual
 pvalue <- pchisq(delta_deviance, diff_degree_of_freedom, lower.tail = FALSE)
 cat(sprintf("Anova test based on CV Deviance: delta_deviance = %.4f, diff_degree_of_freedom = %d, p-value = %.4f\n", delta_deviance, diff_degree_of_freedom, pvalue))
 
-check_summary <- function(result) {
-    sum_mod <- summary(result$fit)
-    coefficients <- sum_mod$coefficients %>% as.data.frame()
+check_summary <- function(result, gam_result = FALSE) {
+    if (gam_result) {
+        coefficients <- summary(result$fit)$p.table %>% as.data.frame()
+    } else {
+        coefficients <- summary(result$fit)$coefficients %>% as.data.frame()
+    }
     coefficients$p.value <- coefficients[, "Pr(>|z|)"]
     coefficients <- coefficients %>% select(Estimate, `Std. Error`, p.value)
     coefficients$significant <- ifelse(coefficients$p.value < 0.05, "Yes", "No")
@@ -2342,8 +2359,8 @@ check_summary <- function(result) {
     return(coefficients)
 }
 
-plot_summary <- function(result, add_text=FALSE) {
-    coefficients <- check_summary(result) 
+plot_summary <- function(result, add_text=FALSE, gam_result = FALSE) {
+    coefficients <- check_summary(result, gam_result = gam_result) 
     mult_df <- coefficients %>% filter(rownames(coefficients) != "(Intercept)")
     ggplot(mult_df, aes(x = rownames(mult_df), y = multiplier, ymin = multiplier_lb, ymax = multiplier_ub)) +
         geom_pointrange(
@@ -2352,14 +2369,14 @@ plot_summary <- function(result, add_text=FALSE) {
         geom_hline(yintercept = 1, linetype = "dashed") +
         {if(add_text) geom_text(
             aes(label = round(multiplier, 2)), vjust = 2, 
-            color = ifelse(mult_df$multiplier > 1, "firebrick", "darkgreen")
+            color = ifelse(mult_df$multiplier >= 1, "firebrick", "darkgreen")
         ) else NULL} +
         coord_flip() +
         labs(x = "Coefficient", y = "Multiplier", title = sprintf("Coefficient Multipliers and 95%% CI\nClaim frequency of the reference category: %.2f", exp(result$fit$coefficients[1]))) +
         theme_minimal()
 }
-coefs <- check_summary(rcat)
-plot_summary(rcat, add_text=TRUE)
+coefs <- check_summary(rcat, gam_result = FALSE)
+plot_summary(rcat, add_text=TRUE, gam_result = FALSE)
 ```
 
 We see that the anova test indicates that the more complex model with categorical variables is a significant improvement over the intercept-only model.
@@ -2418,7 +2435,6 @@ rcontb_rsex <- create_wflow_freq_glm(train_data, fcontb_rsex)
 perf_metrics_df <- append_performance_metrics(name = "Continuous Binned without SEX", formula = fcontb_rsex, result = rcontb_rsex)
 test_p2 <- anova(large_mod, rcontb_rsex$fit, test = "Chisq")
 cat(sprintf("Are we loosing significant explanatory power by removing SEX? %s (p-value = %.4f)\n", ifelse(test_p2$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_p2$`Pr(>Chi)`[2]))
-coefs_contb_p2 <- check_summary(rcontb_rsex)
 perf_metrics_df %>% arrange(CV_Prediction_Error) %>% select(-Formula) %>% kable(
     booktabs = TRUE, caption = "Performance Metrics for Frequency Models After Removing SEX"
 )
@@ -2447,7 +2463,6 @@ r_enr2 <- create_wflow_freq_glm(train_data, f_enr2)
 perf_metrics_df <- append_performance_metrics(name = "Enriched Features", formula = f_enr2, result = r_enr2)
 test_enr2 <- anova(base_mod$fit, r_enr2$fit, test = "Chisq")
 cat(sprintf("Are we gaining significant explanatory power by adding enriched features? %s (p-value = %.4f)\n", ifelse(test_enr2$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_enr2$`Pr(>Chi)`[2]))
-coefs_enr2 <- check_summary(r_enr2)
 plot_summary(r_enr2)
 ```
 
@@ -2467,9 +2482,7 @@ r_enr3 <- list()
 r_enr3$fit <- glm(as.formula(f_enr3), data = train_data, family = poisson())
 test_enr3 <- anova(r_enr2$fit, r_enr3$fit, test = "Chisq")
 cat(sprintf("Does MUNICIPALITY_binned add significant explanatory power? %s (p-value = %.4f)\n", ifelse(test_enr3$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_enr3$`Pr(>Chi)`[2]))
-coefs_enr3 <- check_summary(r_enr3)
 plot_summary(r_enr3)
-# base_mod <- r_enr2$fit
 ```
 
 The interpretation of the `MUNICIPALITY_binned` effect on the model is difficult. We first see that the effet of La Louvière, Charleroi, and Anvers are not significant. Only Mons is significant but barely.
@@ -2488,12 +2501,12 @@ We can prove that by filtering our training data based on these criteria:
 
 ```{r filter_gand}
 train_data %>%
-  filter(POPULATION_binned == "(2.05e+05,4.53e+05]", MUNICIPALITY_binned != "Anvers") %>%
-  select(MUNICIPALITY_binned) %>%
-  unique() %>%
-  kable(
-    caption = "MUNICIPALITY_binned values for the filtered criteria"
-  )
+    filter(POPULATION_binned == "(2.05e+05,4.53e+05]", MUNICIPALITY_binned != "Anvers") %>%
+    select(MUNICIPALITY_binned) %>%
+    unique() %>%
+    kable(
+        caption = "MUNICIPALITY_binned values for the filtered criteria"
+    )
 ```
 
 Even if adding the `MUNICIPALITY_binned` variable to the model adds some explanatory power, it creates multicollinearity issues and provides a single, barely interpretable coefficient for Mons.
@@ -2527,7 +2540,6 @@ r_int <- list()
 r_int$fit <- glm(as.formula(f_int), data = train_data, family = poisson())
 test_int <- anova(base_mod$fit, r_int$fit, test = "Chisq")
 cat(sprintf("Are we gaining significant explanatory power by adding interactions? %s (p-value = %.4f)\n", ifelse(test_int$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_int$`Pr(>Chi)`[2]))
-coefs_int <- check_summary(r_int)
 plot_summary(r_int)
 ```
 
@@ -2543,7 +2555,6 @@ r_sp_int <- list()
 r_sp_int$fit <- glm(as.formula(f_sp_int), data = train_data, family = poisson())
 test_sp_int <- anova(base_mod$fit, r_sp_int$fit, test = "Chisq")
 cat(sprintf("Are we gaining significant explanatory power by adding interactions? %s (p-value = %.4f)\n", ifelse(test_sp_int$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_sp_int$`Pr(>Chi)`[2]))
-coefs_sp_int <- check_summary(r_sp_int)
 plot_summary(r_sp_int)
 ```
 
@@ -2697,12 +2708,121 @@ Our final best GLM model is the simplified one with merged `COVERAGE`, `POWER_bi
 The CV Complexity obviously favors this simplified model, but even the cross-validated deviance and log loss are slightly better which indicates that the model generalizes better.
 We will take this model as the base for our subsequent GAM exploration.
 
+```{r clean_and_save}
+functions <- ls()[sapply(ls(), function(x) is.function(get(x)))]
+rm(list = setdiff(ls(), c(
+    "base_mod", "base_rec", "perf_metrics_df", "base_f",
+    "train_data", "data", "holdout", 
+    "binned_enriched_features", "binned_continuous_features", "continuous_features",
+    "original_categorical_features", "interaction_features",
+    functions)))
+cat(sprintf("Remaining objects and functions: %s", paste(ls(), collapse = ", ")))
+
+# Save remaining objects for gam modelling
+save(list = ls(), file = "../data/after_glm_objects.RData")
+
+```
 
 <br>
 
 ## Frequency GAM Workflow
 
+```{r start_gam}
+load("../data/after_glm_objects.RData")
+```
+
 With our best GLM model as basis, we will explore whether incorporating smoothed terms for continuous variables instead of using bins can improve model performance.
+We will need to adapt the workflow to replace the GLM model with a GAM (bam with parallel processing). Note that `bam` is not part of the parsnip package.
+We will therefore manually handle cross-validation and model fitting for the GAM, instead of relying on the parsnip workflow.
+Also note that discretize = TRUE parameter is necessary to keep the computation time manageable for our cross-validation with large datasets.
+
+```{r create_wflow_freq_gam}
+create_wflow_freq_gam <- function(data, formula, v = 5, rec=recipe(NCLAIMS ~ ., data = data), seed = 123) {
+
+    set.seed(seed)
+
+    folds <- vfold_cv(
+        data, 
+        v = v, 
+        strata = NCLAIMS
+    )
+
+    rec <- prep(rec, training = data)
+
+    cv_results_n <- list()
+
+    print("Starting cross-validation.")
+    for (split in folds$splits) {
+        train_data <- analysis(split)
+        test_data <- assessment(split)
+
+        mod <- bam(
+            formula = as.formula(formula),
+            data = bake(rec, new_data = train_data),
+            family = poisson(),
+            discrete = TRUE, # Enable discrete approximation for faster computation with large datasets
+            nthreads = 5 # Avoid the time to get n_cores
+        )
+        pred <- predict(mod, newdata = bake(rec, new_data = test_data), type = "response")
+        data.frame(
+            NCLAIMS = test_data$NCLAIMS,
+            .pred = pred
+        )
+        cv_results_n[[length(cv_results_n) + 1]] <- data.frame(
+            NCLAIMS = test_data$NCLAIMS,
+            .pred = pred
+        )
+    }
+
+    cv_results <- bind_rows(cv_results_n)
+
+    print("Fitting final GAM model on the full dataset.")
+    # Fit the final model on the training data
+    gam_fit <- bam(
+        formula = as.formula(formula),
+        data = bake(rec, new_data = data),
+        family = poisson(),
+        discrete = TRUE,
+        nthreads = 5
+    )
+
+
+    # Compute the cross-validated metrics
+    print("Computing cross-validated metrics.")
+    cv_metrics <- cv_results %>%
+        mutate(
+            deviance_i = poisson()$dev.resids(
+                y = NCLAIMS, mu = .pred, wt = 1
+            ),
+            log_loss_i = -dpois(
+                NCLAIMS, lambda = .pred, log = TRUE
+            )
+        ) %>%
+        summarise(
+            CV_Deviance = sum(deviance_i),
+            CV_LogLoss = mean(log_loss_i)
+        )
+
+    n <- nrow(data)
+    k <- sum(gam_fit$edf)  # effective degrees of freedom for the model
+    training_deviance <- cv_metrics$CV_Deviance
+    complexity_penalty <- 2 * k
+    estimated_prediction_error <- training_deviance + complexity_penalty
+
+    list(
+        workflow = formula,
+        fit = gam_fit,
+        performance_metrics = list(
+            AIC = AIC(gam_fit),
+            BIC = BIC(gam_fit),
+            CV_Deviance = cv_metrics$CV_Deviance,
+            CV_Complexity = complexity_penalty,
+            CV_Prediction_Error = estimated_prediction_error,
+            CV_LogLoss = cv_metrics$CV_LogLoss
+        )
+    )
+}
+```
 
 ### Smoothing Example for Spatial Effect
 
@@ -2783,17 +2903,146 @@ It is also lower in rural parts of the country namely in the Ardennes and other 
 # )
 ```
 
-### Smooth Terms for Continuous Variables
+### Model fitting and selection
 
-Use the categorical-only frequency GLM as the baseline, then add enriched features and smooth terms for continuous variables.
+We will start from the base model as our benchmark, drop all the binned continuous variables, adapt our recipe, and fit this categorical-only model.
+A new performance dataframe will be created to focus on the GAM improvements specifically.
 
-### Model Fitting, Pruning, and Comparison
+```{r gam-baseline}
+perf_metrics_gam_df <- filter(perf_metrics_df, Model=="Merged POWER_binned")
+base_f <- perf_metrics_gam_df[1,"Formula"]
+cat_only_formula <- base_f
+for (col in c(binned_continuous_features, "POPULATION_binned")) {
+    cat_only_formula <- gsub(paste0(" + ", col), "", cat_only_formula, fixed = TRUE)
+}
+base_rec <- recipe(NCLAIMS ~ ., data = train_data) %>%
+    step_mutate(
+        COVERAGE = fct_collapse(COVERAGE,
+            "OM" = c("PO", "FO")
+        )
+    )
 
-Fit the candidate GAMs, assess the contribution of their terms, and compare their performance using the frequency validation framework.
+# Equivalent to original categorical-only formula with the added REGION_merged enriched feature
+r_cat_only <- create_wflow_freq_glm(train_data, cat_only_formula, rec=base_rec)
+perf_metrics_gam_df <- append_performance_metrics(name = "Categorical Only", formula = cat_only_formula, result = r_cat_only, perf_df = perf_metrics_gam_df)
+test_cat_only <- anova(base_mod$fit, r_cat_only$fit, test = "Chisq")
+cat(sprintf("Are we losing significant explanatory power by removing all binned continuous variables? %s (p-value = %.4f)\n", ifelse(test_cat_only$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test_cat_only$`Pr(>Chi)`[2]))
+perf_metrics_gam_df %>% arrange(CV_Prediction_Error) %>% select(-Formula) %>% knitr::kable(
+    booktabs = TRUE, caption = "Performance Metrics for Categorical-Only Model"
+)
+```
 
-<br>
+Removing all the binned continuous variables has a clear negative impact on the model's explanatory power, we will now see if we can do better than the original best GLM model by incorporating smooth terms for the continuous variables.
+We will start by adding back the continuous variables that were used as binned features in the original model, then we will also add `LONG` and `LAT` that were previously excluded from the model.
 
-### Smooth Effects Compared with Bins and Polynomial Transformations
+```{r gam_with_continuous}
+cont_formula <- paste0(cat_only_formula, " + s(", paste(c(continuous_features, "POPULATION"), collapse = ") + s("), ")")
+cat(sprintf("> Full formula with binned continuous variables: %s", cont_formula))
+
+rcont <- create_wflow_freq_gam(train_data, cont_formula, v=5, rec = base_rec)
+perf_metrics_gam_df <- append_performance_metrics(name = "GAM all", formula = cont_formula, result = rcont, perf_df = perf_metrics_gam_df)
+perf_metrics_gam_df %>% arrange(CV_Prediction_Error) %>% select(-Formula) %>% knitr::kable(
+    booktabs = TRUE, caption = "Performance Metrics for All Smoothed Continuous Model"
+)
+test <- anova(base_mod$fit, rcont$fit, test = "Chisq")
+cat(sprintf("Is the GAM with all smoothed variable a significant improvement over the best GLM model? %s (p-value = %.4f)\n", ifelse(test$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test$`Pr(>Chi)`[2]))
+
+plot_summary(rcont, add_text=TRUE, gam_result = TRUE)
+```
+
+The categorical variables of the GAM can be vizualised as we did for the GLM, we see that the `SEX` variable is not significant now that we added the smoothed continuous variables.
+It was already barely significant in the GLM, we will then fit a new GAM without the `SEX` variable. For the smoothed continuous variables, we will look at their significance. 
+Shapes will only be interpreted and compared to the binned continuous effects when the final GAM model will have been selected.
+
+```{r gam_all_cont_sign}
+summary(rcont$fit)$s.table %>% kable(
+    caption = "Significance of Smoothed Continuous Variables",
+    booktabs = TRUE
+)
+base_mod <- rcont
+base_f <- cont_formula
+# base_rec does not change
+```
+
+Even if the smoothed age of the car `s(AGEC)` is less significant than the other continuous variables, they are all very significant and should remain in the model.
+The `edf` (effective degrees of freedom) values indicate the complexity of the smooth terms, with higher values corresponding to higher degrees of the variable's non-linear effect.
+The `Ref.df` (reference degrees of freedom) values are the df used for the Chisq test to assess the significance of the smooth terms.
+Let's continue with the same model without the `SEX` predictor.
+
+```{r gam_with_continuous_m_sex}
+cont_msex_f <- gsub(" \\+ SEX", "", cont_formula)
+cat(sprintf("> Full formula with binned continuous variables: %s", cont_msex_f))
+
+rcont_msex <- create_wflow_freq_gam(train_data, cont_msex_f, v=5, rec = base_rec)
+perf_metrics_gam_df <- append_performance_metrics(name = "GAM all without SEX", formula = cont_msex_f, result = rcont_msex, perf_df = perf_metrics_gam_df)
+perf_metrics_gam_df %>% arrange(CV_Prediction_Error) %>% select(-Formula) %>% knitr::kable(
+    booktabs = TRUE, caption = "Performance Metrics including All Smoothed Continuous Model without SEX"
+)
+test <- anova(base_mod$fit, rcont_msex$fit, test = "Chisq")
+cat(sprintf("Are we gaining significant predictive power by keeping the SEX variable? %s (p-value = %.4f)\n", ifelse(test$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test$`Pr(>Chi)`[2]))
+
+plot_summary(rcont_msex, add_text=TRUE, gam_result = TRUE)
+
+summary(rcont_msex$fit)$s.table %>% kable(
+    caption = "Significance of Smoothed Continuous Variables",
+    booktabs = TRUE
+)
+```
+
+The model without sex performs better in terms of AIC, BIC, and cross-validated prediction error which is expected because of the impact on the complexity penalty term.
+It also performs better on the cross-validated deviance and log loss indicating that removing the `SEX` variable does not harm absolute predictive performance.
+
+```{r gam_all_cont_msex_new_best}
+base_mod <- rcont_msex
+base_f <- cont_msex_f
+# base_rec does not change
+```
+
+Finally, let's add the new variables `LONG` and `LAT` as a bivariate smooth term in the model as we did in the introductory example:
+
+```{r gam_with_long_lat}
+cont_msex_longlat_f <- paste0(cont_msex_f, " + s(LONG, LAT)")
+cat(sprintf("> Full formula with binned continuous variables and LONG/LAT: %s", cont_msex_longlat_f))
+
+rcont_msex_longlat <- create_wflow_freq_gam(train_data, cont_msex_longlat_f, v=5, rec = base_rec)
+perf_metrics_gam_df <- append_performance_metrics(name = "GAM all without SEX with LONG/LAT", formula = cont_msex_longlat_f, result = rcont_msex_longlat, perf_df = perf_metrics_gam_df)
+perf_metrics_gam_df %>% arrange(CV_Prediction_Error) %>% select(-Formula) %>% knitr::kable(
+    booktabs = TRUE, caption = "Performance Metrics including All Smoothed Continuous Model without SEX and with LONG/LAT"
+)
+
+test <- anova(base_mod$fit, rcont_msex_longlat$fit, test = "Chisq")
+cat(sprintf("Are we gaining significant predictive power by adding the LONG and LAT variables? %s (p-value = %.4f)\n", ifelse(test$`Pr(>Chi)`[2] < 0.05, "Yes", "No"), test$`Pr(>Chi)`[2]))
+
+summary(rcont_msex_longlat$fit)$s.table %>% kable(
+    caption = "Significance of Smoothed Continuous Variables including LONG/LAT",
+    booktabs = TRUE
+)
+```
+
+We have again a big improvement regarding all performance metrics despite the increase in complexity due to the addition of the bivariate smooth term for `LONG` and `LAT`.
+As summarized by the GAM model leaderboard, our final model for the frequency is our GAM with all smooth term and without the SEX:
+
+```{r final_gam_leaderboard}
+p1 <- plot_leaderboard(perf_metrics_gam_df, "AIC", "AIC")
+p2 <- plot_leaderboard(perf_metrics_gam_df, "BIC", "BIC")
+p3 <- plot_leaderboard(perf_metrics_gam_df, "CV_Prediction_Error", "CV Prediction Error")
+p4 <- plot_leaderboard(
+    perf_metrics_gam_df, "CV_LogLoss", "CV Log Loss", digits = 4
+)
+
+(p1 | p2) / (p3 | p4) +
+    plot_annotation(
+        title = "GAM Model performance leaderboard",
+        subtitle = "Best model highlighted in green"
+)
+```
+
+We notice again that the `AIC`, `CV Prediction Error`, and `CV Log Loss` rankings are aligned. 
+The `BIC` metric penalizes the bivariate smooth term for `LONG` and `LAT` heavily because it represents `r summary(rcont_msex_longlat$fit)$s.table["s(LONG,LAT)","edf"]` effective degrees of freedom for a single smoothed function.
+We select our best model after the GLM and GAM model as the GAM with all continuous features, without the sex, and with the bivariate smooth term with `LONG` and `LAT`.
+The final section of the frequency modelling compares the best GAM and best GLM models.
+
+### Comparing GLM and GAM Models
 
 Visualize the smooth functions and compare their shapes with the binned numerical effects and the raw and orthogonal polynomial explorations.
 
